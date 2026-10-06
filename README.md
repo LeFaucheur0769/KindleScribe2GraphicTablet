@@ -1,27 +1,54 @@
-# KindleScribe2GraphicTablet
-100% vibecoded don't get angry the point was just to have it working
-
-
 # Kindle Scribe as a Graphics Tablet
 
-Turn a **jailbroken Kindle Scribe** into a drawing tablet for a host machine
+**100% vibecoded.** No apology, no hidden agenda — the goal is to make a
+jailbroken Kindle Scribe usable as a graphics tablet, and it does. Bug
+reports and PRs welcome; don't expect beautiful architecture.
+
+Turn a jailbroken Kindle Scribe into a drawing tablet for a host machine
 (Linux first; macOS/Windows with extra plumbing).
 
-- The host owns the canvas (Pillow).
-- The canvas is streamed to the Scribe over SSH + FBInk using adaptive
-  waveforms (DU while drawing, GL16/GC16 to settle).
-- Stylus input on the Scribe is read via evdev, calibrated, and either drawn
-  straight onto the canvas or injected into the host OS via `uinput`
-  (works on X11 *and* Wayland), `xdotool` or `ydotool`.
+Two independent modes:
+
+- **Canvas mode** (`--inject canvas`, default) — the host owns a Pillow
+  canvas, streams it to the Scribe over SSH + FBInk using adaptive
+  waveforms, and draws strokes into the canvas from the Scribe's pen.
+  Save PNG / PDF / JSON.
+- **System tablet mode** (`--inject uinput`) — the Scribe becomes a
+  real kernel-level Wacom-class tablet for the host. Cursor follows the
+  pen, taps click, pressure flows into Krita/GIMP/Inkscape. Works on
+  X11 **and** Wayland. Nothing is streamed to the Scribe in this mode.
+
+Mixing them (draw on the Kindle while Krita is the target) is not
+supported yet — one mode at a time.
+
+---
 
 ## Requirements
 
-- A **jailbroken Kindle Scribe** with SSH access and `fbink` installed.
-- Host: Python ≥ 3.9, `Pillow`.
-  - `--inject uinput` additionally needs `python-evdev` (Linux).
-  - `--inject xdotool` needs `xdotool` (X11).
-  - `--inject ydotool` needs `ydotool` (Wayland).
-- Optional: `--gui` needs Tkinter (usually bundled with CPython).
+**Host**
+
+- Python ≥ 3.9
+- `Pillow`
+- `python-evdev` (only for `--inject uinput`; Linux)
+- Optional fallbacks: `xdotool` (X11), `ydotool` (Wayland)
+- Optional GUI: `tkinter` (usually bundled with CPython)
+
+**Kindle**
+
+- A **jailbroken Kindle Scribe** with SSH access
+- `fbink` installed (any recent build; this project is tested against
+  FBInk 1.25). If it lives somewhere non-standard, pass `--fbink`.
+
+**Install**
 
 ```bash
 pip install -r requirements.txt
+
+# For --inject uinput
+sudo tee /etc/udev/rules.d/99-uinput.rules >/dev/null <<'EOF'
+KERNEL=="uinput", MODE="0660", GROUP="input", OPTIONS+="static_node=uinput"
+EOF
+sudo modprobe uinput
+echo uinput | sudo tee /etc/modules-load.d/uinput.conf
+sudo usermod -aG input "$USER"
+# log out / back in so the group applies
