@@ -171,8 +171,8 @@ class Streamer(threading.Thread):
         if self._last is None or self._last.size != preview.size:
             self._send_full(preview)
             self._last = preview
-            self._dirty_union = (0, 0, self._panel_w, self._panel_h)
-            self._clean_pending = True
+            self._dirty_union = None       # was: (0, 0, W, H)
+            self._clean_pending = False    # was: True
             self._last_activity = time.time()
             return
 

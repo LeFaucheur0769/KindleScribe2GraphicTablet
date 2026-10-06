@@ -5,28 +5,30 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import re
 import signal
 import subprocess
-import sys
 import threading
 import time
-from typing import Optional
+from typing import Optional, Tuple
 
 from .calibration import (
     build_transform,
     calibrate,
     load_calibration,
     raw_to_canvas,
+    raw_to_target,
     save_calibration,
     validate_calibration,
 )
-from .canvas import ERASER, HIGHLIGHTER, PEN
+from .canvas import Canvas, Brush  # noqa: F401  (re-exported for callers)
 from .config import (
     AppConfig,
     InjectConfig,
     KindleConfig,
     OutputConfig,
     PanelConfig,
+    PenConfig,
     StreamConfig,
     StylusConfig,
 )
@@ -73,9 +75,9 @@ def parse_args(argv=None) -> argparse.Namespace:
 
     # Panel
     p.add_argument("--width", type=int, default=1860,
-                   help="Kindle panel width in pixels (portrait)")
+                   help="Kindle panel width in pixels (native portrait)")
     p.add_argument("--height", type=int, default=2480,
-                   help="Kindle panel height in pixels (portrait)")
+                   help="Kindle panel height in pixels (native portrait)")
     p.add_argument("--aspect", choices=["fit", "crop", "stretch"], default="fit")
 
     # Canvas
@@ -92,14 +94,41 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--cal-path", default="~/.kindle_draw_cal.json")
     p.add_argument("--no-input", action="store_true",
                    help="Don't read stylus events (display only)")
+    p.add_argument("--rotate", default="auto",
+                   help="Panel rotation: 0/90/180/270, or 'auto'. "
+                        "'auto' matches your host screen shape for "
+                        "system injectors (uinput/xdotool/ydotool), and "
+                        "means 0 (no rotation) for canvas/GUI mode. "
+                        "Pass an explicit value to override.")
     p.add_argument("--pressure-min", type=int, default=None)
     p.add_argument("--pressure-max", type=int, default=None)
+
+    # Pen
+    g = p.add_argument_group("Pen")
+    g.add_argument("--pen-color", default=None,
+                   help="Pen colour: '#000000', '#f00', 'rgb(0,0,0)', or a "
+                        "name (black, white, red, green, blue, orange, "
+                        "yellow, purple, pink, gray)")
+    g.add_argument("--pen-size", type=float, default=None,
+                   help="Max pen stroke width in pixels (default 3)")
+    g.add_argument("--eraser-size", type=float, default=None,
+                   help="Eraser width in pixels (default 24)")
+    g.add_argument("--no-pressure", dest="pressure_sensitive",
+                   action="store_false", default=None,
+                   help="Disable pressure sensitivity (constant stroke width)")
 
     # Injection
     p.add_argument("--inject",
                    choices=["uinput", "xdotool", "ydotool", "canvas", "none"],
                    default="canvas",
                    help="Where to send stylus input (default: draw on canvas)")
+    p.add_argument("--inject-size", default="auto",
+                   help="Target size for uinput/xdotool/ydotool: 'WxH' or "
+                        "'auto' to use the primary monitor's resolution "
+                        "(default). Ignored for canvas mode.")
+    p.add_argument("--no-letterbox", action="store_true",
+                   help="For uinput/etc., stretch the pen across the whole "
+                        "target instead of preserving the Scribe's aspect ratio")
 
     # Output
     p.add_argument("--save-png", default=None)
@@ -138,14 +167,94 @@ def parse_args(argv=None) -> argparse.Namespace:
 # --------------------------------------------------------------------------- #
 
 def setup_logging(verbose: int) -> None:
-    # 0 -> INFO (so --calibrate shows its prompts)
-    # >=1 -> DEBUG
     level = logging.INFO if verbose < 1 else logging.DEBUG
     logging.basicConfig(
         level=level,
         format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
         datefmt="%H:%M:%S",
     )
+    logging.getLogger("PIL").setLevel(logging.WARNING)
+    logging.getLogger("PIL.Image").setLevel(logging.WARNING)
+
+
+# --------------------------------------------------------------------------- #
+# Screen size detection (single copy)                                        #
+# --------------------------------------------------------------------------- #
+
+def detect_screen_size() -> Optional[Tuple[int, int]]:
+    """Best-effort primary-monitor resolution in logical pixels."""
+    import json
+    import shutil
+
+    # wlroots (Sway, Hyprland, river, Wayfire)
+    if shutil.which("wlr-randr"):
+        try:
+            out = subprocess.run(["wlr-randr", "--json"],
+                                 capture_output=True, text=True,
+                                 timeout=2).stdout
+            for m in json.loads(out):
+                if m.get("enabled"):
+                    mode = m.get("current_mode") or {}
+                    scale = m.get("scale") or 1
+                    w = mode.get("width")
+                    h = mode.get("height")
+                    if w and h:
+                        return int(w / scale), int(h / scale)
+        except Exception:
+            pass
+
+    # KDE Plasma
+    if shutil.which("kscreen-doctor"):
+        try:
+            out = subprocess.run(["kscreen-doctor", "-o"],
+                                 capture_output=True, text=True,
+                                 timeout=2).stdout
+            m = re.search(r"Geometry:\s*\d+,\d+\s+(\d+)x(\d+)", out)
+            if m:
+                return int(m.group(1)), int(m.group(2))
+        except Exception:
+            pass
+
+    # GNOME / Mutter
+    for tool in ("gnome-randr", "gnome-monitor-config"):
+        if shutil.which(tool):
+            try:
+                argv = [tool] if tool == "gnome-randr" else [tool, "list"]
+                out = subprocess.run(argv, capture_output=True, text=True,
+                                     timeout=2).stdout
+                m = re.search(r"(\d{3,5})x(\d{3,5})", out)
+                if m:
+                    return int(m.group(1)), int(m.group(2))
+            except Exception:
+                pass
+
+    # X11 / XWayland
+    if shutil.which("xrandr"):
+        try:
+            out = subprocess.run(["xrandr", "--query"],
+                                 capture_output=True, text=True,
+                                 timeout=2).stdout
+            for line in out.splitlines():
+                if "*" in line:
+                    m = re.search(r"(\d+)x(\d+)", line)
+                    if m:
+                        return int(m.group(1)), int(m.group(2))
+        except Exception:
+            pass
+
+    # Tkinter (works on any display server, always logical pixels)
+    try:
+        import tkinter as tk
+        root = tk.Tk()
+        root.withdraw()
+        w, h = root.winfo_screenwidth(), root.winfo_screenheight()
+        root.destroy()
+        if w and h:
+            return int(w), int(h)
+    except Exception:
+        pass
+
+    return None
 
 
 # --------------------------------------------------------------------------- #
@@ -166,6 +275,9 @@ class StylusReader(threading.Thread):
         logger: StrokeLogger,
         streamer: Streamer,
         stop_event: threading.Event,
+        target_size: Optional[Tuple[int, int]] = None,
+        letterbox: bool = True,
+        stream_enabled: bool = True,
     ) -> None:
         super().__init__(daemon=True, name="StylusReader")
         self.kindle = kindle
@@ -177,6 +289,9 @@ class StylusReader(threading.Thread):
         self.logger = logger
         self.streamer = streamer
         self.stop_event = stop_event
+        self.target_size = target_size
+        self.letterbox = letterbox
+        self.stream_enabled = stream_enabled
         self._proc: Optional[subprocess.Popen] = None
 
     def run(self) -> None:
@@ -187,6 +302,8 @@ class StylusReader(threading.Thread):
                 self._loop()
                 backoff = 0.5
             except Exception as exc:
+                if self.stop_event.is_set():
+                    break
                 log.warning("stylus stream error: %s", exc)
                 time.sleep(backoff)
                 backoff = min(5.0, backoff * 2)
@@ -201,6 +318,8 @@ class StylusReader(threading.Thread):
             while not self.stop_event.is_set():
                 chunk = proc.stdout.read(self.esz * 64)
                 if not chunk:
+                    if self.stop_event.is_set():
+                        return
                     raise RuntimeError("stylus stream ended")
                 buf += chunk
                 while len(buf) >= self.esz:
@@ -218,14 +337,29 @@ class StylusReader(threading.Thread):
             self._proc = None
 
     def _dispatch(self, ev) -> None:
-        canvas = self.pages.current()
-        cw, ch = canvas.width, canvas.height
-        x, y, p = raw_to_canvas(self.cal, ev.x, ev.y, ev.pressure, cw, ch)
-        x = max(0.0, min(cw - 1.0, x))
-        y = max(0.0, min(ch - 1.0, y))
+        if self.target_size is not None:
+            tw, th = self.target_size
+            if self.letterbox:
+                x, y, p = raw_to_target(self.cal, ev.x, ev.y, ev.pressure,
+                                        tw, th)
+            else:
+                x, y, p = raw_to_canvas(self.cal, ev.x, ev.y, ev.pressure,
+                                        tw, th)
+            x = max(0.0, min(tw - 1.0, x))
+            y = max(0.0, min(th - 1.0, y))
+        else:
+            canvas = self.pages.current()
+            cw, ch = canvas.width, canvas.height
+            x, y, p = raw_to_canvas(self.cal, ev.x, ev.y, ev.pressure, cw, ch)
+            x = max(0.0, min(cw - 1.0, x))
+            y = max(0.0, min(ch - 1.0, y))
+            canvas.set_brush_for(eraser=ev.eraser)
 
-        # Brush selection is a no-op for non-canvas injectors, harmless.
-        canvas.set_brush(ERASER if ev.eraser else PEN)
+        if hasattr(self.injector, "set_eraser"):
+            try:
+                self.injector.set_eraser(ev.eraser)
+            except Exception:
+                log.debug("set_eraser failed", exc_info=True)
 
         if ev.kind == "down":
             self.logger.begin(x, y, p, eraser=ev.eraser)
@@ -237,7 +371,8 @@ class StylusReader(threading.Thread):
             self.logger.end(x, y, p)
             self.injector.up(x, y, p)
 
-        self.streamer.wake()
+        if self.stream_enabled:
+            self.streamer.wake()
 
     def stop(self) -> None:
         self.stop_event.set()
@@ -254,7 +389,6 @@ class StylusReader(threading.Thread):
 # --------------------------------------------------------------------------- #
 
 def probe_esz(kindle: KindleLink, dev: str, timeout: float = 12.0) -> int:
-    """Ask the user to tap the screen once so we can detect the struct size."""
     log.info("probing event struct size — tap the stylus on the screen now")
     proc = kindle.popen(f"cat {dev}")
     try:
@@ -279,13 +413,145 @@ def probe_esz(kindle: KindleLink, dev: str, timeout: float = 12.0) -> int:
 
 
 # --------------------------------------------------------------------------- #
-# Main                                                                       #
+# Colour parsing                                                             #
 # --------------------------------------------------------------------------- #
+
+_NAMED_COLORS = {
+    "black":  (0, 0, 0),
+    "white":  (255, 255, 255),
+    "red":    (220, 50, 47),
+    "green":  (60, 170, 60),
+    "blue":   (50, 80, 220),
+    "orange": (245, 130, 32),
+    "yellow": (255, 200, 0),
+    "purple": (150, 60, 200),
+    "pink":   (240, 120, 180),
+    "gray":   (100, 100, 100),
+    "grey":   (100, 100, 100),
+}
+
+
+def _parse_color(s):
+    if s is None:
+        return None
+    s = s.strip().lower()
+    if s.startswith("#"):
+        h = s[1:]
+        if len(h) == 3:
+            h = "".join(c * 2 for c in h)
+        if len(h) != 6:
+            raise ValueError(f"bad hex colour: {s!r}")
+        try:
+            return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+        except ValueError:
+            raise ValueError(f"bad hex colour: {s!r}")
+    if s in _NAMED_COLORS:
+        return _NAMED_COLORS[s]
+    m = re.match(r"rgb\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)", s)
+    if m:
+        vals = tuple(int(g) for g in m.groups())
+        if any(v < 0 or v > 255 for v in vals):
+            raise ValueError(f"rgb component out of range: {s!r}")
+        return vals
+    raise ValueError(
+        f"cannot parse colour {s!r}: use '#rrggbb', '#rgb', 'rgb(r,g,b)', "
+        f"or one of {', '.join(sorted(_NAMED_COLORS))}"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Config                                                                     #
+# --------------------------------------------------------------------------- #
+
+def _resolve_rotation(raw, canvas_mode: bool) -> int:
+    """Return 0/90/180/270 from the CLI value.
+
+    Auto-rotation is a system-tablet concept: it matches the pen to the
+    host screen's shape. In canvas/GUI mode the canvas is fixed portrait,
+    so 'auto' means 'no rotation'.
+    """
+    if raw == "auto":
+        if canvas_mode:
+            log.info("canvas mode: auto-rotation disabled (rotation=0)")
+            return 0
+        size = detect_screen_size()
+        if size is None:
+            log.warning("could not detect screen size; assuming portrait "
+                        "(rotation=0). Pass --rotate 90 for landscape.")
+            return 0
+        w, h = size
+        if w > h:
+            log.info("screen is landscape (%dx%d) -> rotation=90 "
+                     "(use --rotate 270 if it feels mirrored)", w, h)
+            return 90
+        log.info("screen is portrait (%dx%d) -> rotation=0", w, h)
+        return 0
+    try:
+        rotation = int(raw)
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"--rotate must be auto/0/90/180/270, got {raw!r}"
+        )
+    if rotation not in (0, 90, 180, 270):
+        raise ValueError(f"--rotate must be 0/90/180/270, got {rotation}")
+    return rotation
+
 
 def build_config(args: argparse.Namespace) -> AppConfig:
     canvas_w = args.canvas_width or args.width
     canvas_h = args.canvas_height or args.height
-    kd = KindleConfig()   # class defaults (your edited host/port/user)
+    kd = KindleConfig()
+
+    # --- pen --------------------------------------------------------- #
+    pen = PenConfig()
+    color = _parse_color(args.pen_color)
+    if color is not None:
+        pen.color = color
+    if args.pen_size is not None:
+        if args.pen_size <= 0:
+            raise ValueError(f"--pen-size must be > 0, got {args.pen_size}")
+        pen.size = float(args.pen_size)
+    if args.eraser_size is not None:
+        if args.eraser_size <= 0:
+            raise ValueError(
+                f"--eraser-size must be > 0, got {args.eraser_size}"
+            )
+        pen.eraser_size = float(args.eraser_size)
+    if getattr(args, "pressure_sensitive", None) is not None:
+        pen.pressure_sensitive = bool(args.pressure_sensitive)
+
+    # --- inject target size ----------------------------------------- #
+    if args.inject in ("uinput", "xdotool", "ydotool"):
+        inject_w, inject_h = 1920, 1080   # fallback
+        if args.inject_size in (None, "auto"):
+            detected = detect_screen_size()
+            if detected:
+                inject_w, inject_h = detected
+                log.info("detected primary monitor: %dx%d",
+                         inject_w, inject_h)
+            else:
+                log.warning("could not detect screen size; falling back "
+                            "to 1920x1080. Pass --inject-size WxH to override.")
+        else:
+            try:
+                inject_w, inject_h = (
+                    int(x) for x in args.inject_size.lower().split("x")
+                )
+            except Exception:
+                raise ValueError(
+                    f"--inject-size must be WxH or 'auto', got "
+                    f"{args.inject_size!r}"
+                )
+    else:
+        # Canvas mode: internal canvas size, no screen detection needed.
+        inject_w, inject_h = canvas_w, canvas_h
+
+    # --- panel rotation --------------------------------------------- #
+    # Auto-rotation only makes sense when we're driving the host's cursor.
+    # For canvas/GUI mode, 'auto' means 'no rotation'.
+    canvas_mode = args.inject == "canvas"
+    rotation = _resolve_rotation(args.rotate, canvas_mode=canvas_mode)
+
     return AppConfig(
         kindle=KindleConfig(
             host=args.kindle or kd.host,
@@ -309,7 +575,9 @@ def build_config(args: argparse.Namespace) -> AppConfig:
             cal_path=args.cal_path,
             pressure_min=args.pressure_min,
             pressure_max=args.pressure_max,
+            rotate=rotation,          # <-- resolved int, not args.rotate
         ),
+        pen=pen,
         stream=StreamConfig(
             active_wf=args.active_wf,
             clean_wf=args.clean_wf,
@@ -319,7 +587,11 @@ def build_config(args: argparse.Namespace) -> AppConfig:
             threshold=args.threshold,
             align=args.align,
         ),
-        inject=InjectConfig(mode=args.inject),
+        inject=InjectConfig(
+            mode=args.inject,
+            width=inject_w,
+            height=inject_h,
+        ),
         output=OutputConfig(
             save_png=args.save_png,
             save_pdf=args.save_pdf,
@@ -335,6 +607,11 @@ def build_config(args: argparse.Namespace) -> AppConfig:
         no_screensaver=args.no_screensaver,
         verbose=args.verbose,
     )
+
+
+# --------------------------------------------------------------------------- #
+# Main                                                                       #
+# --------------------------------------------------------------------------- #
 
 def main(argv=None) -> int:
     args = parse_args(argv)
@@ -367,7 +644,6 @@ def main(argv=None) -> int:
 
     # --- choose stylus device ---------------------------------------- #
     dev = cfg.stylus.dev
-    stylus_info = None
     if dev is None:
         stylus_info = find_stylus_device(info["devices"])
         if stylus_info is None:
@@ -375,12 +651,12 @@ def main(argv=None) -> int:
         else:
             dev = stylus_info["event"]
             log.info("stylus device: %s (%s)", dev, stylus_info.get("name"))
-    else:
-        stylus_info = {"event": dev, "name": "manual"}
 
     esz = cfg.stylus.esz
     if dev and esz is None:
         esz = probe_esz(kindle, dev)
+
+    rotation = cfg.stylus.rotate
 
     # --- calibration -------------------------------------------------- #
     if cfg.calibrate:
@@ -389,7 +665,6 @@ def main(argv=None) -> int:
             kindle.close()
             return 2
 
-        # Keep the panel awake and quiet while we ask the user to tap.
         try:
             kindle.enable_no_screensaver()
         except Exception:
@@ -400,11 +675,21 @@ def main(argv=None) -> int:
             except Exception:
                 log.debug("freeze_ui failed", exc_info=True)
 
-        log.info("calibrating using %s", dev)
+        log.info("calibrating using %s (rotation=%d°)", dev, rotation)
         try:
-            samples = calibrate(
-                kindle, cfg.panel.width, cfg.panel.height, dev, esz
-            )
+            try:
+                samples = calibrate(
+                    kindle, cfg.panel.width, cfg.panel.height, dev, esz,
+                    rotation=rotation,
+                )
+            except TypeError:
+                # calibration.calibrate doesn't yet support rotation=
+                log.warning("calibration module has no rotation support; "
+                            "falling back to unrotated calibration")
+                samples = calibrate(
+                    kindle, cfg.panel.width, cfg.panel.height, dev, esz,
+                )
+                rotation = 0
         except Exception as exc:
             log.error("calibration failed: %s", exc)
             samples = None
@@ -432,17 +717,28 @@ def main(argv=None) -> int:
             pmax = pmin + 4095
 
         transform = build_transform(samples)
+
+        # Swap panel dims for 90/270 so the stored size matches the user's
+        # perceived frame (what the crosshairs were drawn as).
+        if rotation in (90, 270):
+            user_w, user_h = cfg.panel.height, cfg.panel.width
+        else:
+            user_w, user_h = cfg.panel.width, cfg.panel.height
+
         cal = {
             "dev": dev,
             "esz": esz,
-            "panel":  {"width": cfg.panel.width,  "height": cfg.panel.height},
+            "rotation": rotation,
+            "panel":  {"width": user_w, "height": user_h},
             "canvas": {"width": cfg.canvas_width, "height": cfg.canvas_height},
             "points": samples,
             "transform": transform,
             "pressure": {"min": pmin, "max": pmax},
         }
         save_calibration(cfg.stylus.cal_path, cal)
-        log.info("wrote %s", os.path.expanduser(cfg.stylus.cal_path))
+        log.info("wrote %s (panel %dx%d, rotation %d°)",
+                 os.path.expanduser(cfg.stylus.cal_path),
+                 user_w, user_h, rotation)
         kindle.clear_screen()
         kindle.close()
         return 0
@@ -454,6 +750,15 @@ def main(argv=None) -> int:
         try:
             cal = load_calibration(cfg.stylus.cal_path)
             validate_calibration(cal)
+
+            cal_rot = cal.get("rotation", 0)
+            if cal_rot != rotation:
+                log.warning(
+                    "calibration was done with rotation=%d° but you're "
+                    "running with rotation=%d°. Re-run with --calibrate "
+                    "if the pen feels wrong.", cal_rot, rotation,
+                )
+
             if cfg.stylus.pressure_min is not None:
                 cal["pressure"]["min"] = cfg.stylus.pressure_min
             if cfg.stylus.pressure_max is not None:
@@ -476,13 +781,39 @@ def main(argv=None) -> int:
     pages = PageManager(cfg.canvas_width, cfg.canvas_height)
     stop_event = threading.Event()
 
+    canvas = pages.current()
+    canvas.set_pen_color(cfg.pen.color)
+    canvas.set_pen_size(cfg.pen.size)
+    canvas.set_eraser_size(cfg.pen.eraser_size)
+    canvas.set_pressure_sensitive(cfg.pen.pressure_sensitive)
+    log.info("pen: color=%s size=%.1f eraser=%.1f pressure=%s",
+             cfg.pen.color, cfg.pen.size, cfg.pen.eraser_size,
+             cfg.pen.pressure_sensitive)
+
+    def _apply_pen_to_current():
+        c = pages.current()
+        c.set_pen_color(cfg.pen.color)
+        c.set_pen_size(cfg.pen.size)
+        c.set_eraser_size(cfg.pen.eraser_size)
+        c.set_pressure_sensitive(cfg.pen.pressure_sensitive)
+
+    pages.add_listener(_apply_pen_to_current)
+
+    # --- injector ----------------------------------------------------- #
+    is_system_inject = cfg.inject.mode in ("uinput", "xdotool", "ydotool")
     try:
-        injector = build_injector(cfg.inject.mode, pages.current,
-                                  cfg.canvas_width, cfg.canvas_height)
+        injector = build_injector(
+            cfg.inject.mode,
+            pages.current,
+            cfg.inject.width if is_system_inject else cfg.canvas_width,
+            cfg.inject.height if is_system_inject else cfg.canvas_height,
+        )
     except Exception as exc:
         log.error("failed to build injector %r: %s", cfg.inject.mode, exc)
         kindle.close()
         return 2
+
+    stream_enabled = not is_system_inject
 
     streamer = Streamer(kindle, pages.current, cfg.stream, stop_event)
     streamer.set_panel(cfg.panel.width, cfg.panel.height, cfg.panel.aspect)
@@ -507,6 +838,10 @@ def main(argv=None) -> int:
             logger=stroke_logger,
             streamer=streamer,
             stop_event=stop_event,
+            target_size=(cfg.inject.width, cfg.inject.height)
+                        if is_system_inject else None,
+            letterbox=not args.no_letterbox,
+            stream_enabled=stream_enabled,
         )
 
     # --- Kindle housekeeping ------------------------------------------ #
@@ -521,41 +856,53 @@ def main(argv=None) -> int:
         except Exception:
             log.debug("freeze_ui failed", exc_info=True)
 
-    try:
-        kindle.clear_screen()
-    except Exception as exc:
-        log.warning("clear_screen failed: %s", exc)
+    if stream_enabled:
+        try:
+            kindle.clear_screen()
+        except Exception as exc:
+            log.warning("clear_screen failed: %s", exc)
 
-    # Page changes must trigger a full refresh.
     def on_page_change() -> None:
-        streamer.reset()
+        if stream_enabled:
+            streamer.reset()
 
     pages.add_listener(on_page_change)
 
     # --- optional GUI -------------------------------------------------- #
     gui = None
-    if args.gui:
+    if args.gui and stream_enabled:
         try:
             from .gui import DrawingWindow
             gui = DrawingWindow(pages, streamer)
         except Exception as exc:
             log.warning("GUI unavailable: %s", exc)
             gui = None
+    elif args.gui and not stream_enabled:
+        log.warning("--gui is only meaningful with --inject canvas; ignoring")
 
     # --- signals ------------------------------------------------------ #
     def _stop(*_sig) -> None:
         log.info("shutdown requested")
         stop_event.set()
-        streamer.wake()
+        if stream_enabled:
+            streamer.wake()
 
     signal.signal(signal.SIGINT, _stop)
     signal.signal(signal.SIGTERM, _stop)
 
     # --- start threads ------------------------------------------------ #
-    stroke_logger.start()
-    streamer.start()
+    if stream_enabled:
+        stroke_logger.start()
+        streamer.start()
     if reader is not None:
         reader.start()
+
+    log.info("running. inject=%s stream=%s target=%s rotation=%d°",
+             cfg.inject.mode,
+             "on" if stream_enabled else "off",
+             f"{cfg.inject.width}x{cfg.inject.height}"
+             if is_system_inject else "canvas",
+             rotation)
 
     # --- main loop ---------------------------------------------------- #
     try:
@@ -567,29 +914,31 @@ def main(argv=None) -> int:
         stop_event.set()
     finally:
         stop_event.set()
-        streamer.wake()
+        if stream_enabled:
+            streamer.wake()
 
         if reader is not None:
             reader.stop()
-        streamer.join(timeout=4)
-        stroke_logger.stop()
+        if stream_enabled:
+            streamer.join(timeout=4)
+            stroke_logger.stop()
         try:
             injector.close()
         except Exception:
             pass
 
-        # Final save.
         try:
             if cfg.output.pages_dir:
                 paths = pages.save_all_png(cfg.output.pages_dir)
-                log.info("saved %d page PNGs to %s", len(paths), cfg.output.pages_dir)
-                pages.save_all_pdf(os.path.join(cfg.output.pages_dir, "pages.pdf"))
+                log.info("saved %d page PNGs to %s",
+                         len(paths), cfg.output.pages_dir)
+                pages.save_all_pdf(
+                    os.path.join(cfg.output.pages_dir, "pages.pdf"))
             else:
                 stroke_logger.save_all()
         except Exception:
             log.exception("final save failed")
 
-        # Restore Kindle state.
         try:
             if cfg.freeze_ui:
                 kindle.unfreeze_ui()
@@ -600,10 +949,11 @@ def main(argv=None) -> int:
                 kindle.disable_no_screensaver()
         except Exception:
             log.debug("disable_no_screensaver failed", exc_info=True)
-        try:
-            kindle.clear_screen()
-        except Exception:
-            log.debug("clear_screen failed", exc_info=True)
+        if stream_enabled:
+            try:
+                kindle.clear_screen()
+            except Exception:
+                log.debug("clear_screen failed", exc_info=True)
         kindle.close()
         if gui is not None:
             gui.close()

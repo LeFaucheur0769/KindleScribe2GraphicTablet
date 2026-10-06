@@ -13,11 +13,31 @@ from typing import Optional, Tuple
 from PIL import Image, ImageDraw
 
 try:
-    LANCZOS = Image.Resampling.LANCZOS  # Pillow ≥ 9.1
+    LANCZOS = Image.Resampling.LANCZOS
 except AttributeError:                    # pragma: no cover
     LANCZOS = Image.LANCZOS
+try:
+    BILINEAR = Image.Resampling.BILINEAR
+except AttributeError:
+    BILINEAR = Image.BILINEAR
 
 Box = Tuple[int, int, int, int]
+
+# Default palette exposed to the GUI. Colours are chosen to look good on
+# e-ink (they end up quantised to 16 greys, so saturated hues survive as
+# dark/mid/light bands rather than as hue).
+PALETTE: Tuple[Tuple[int, int, int], ...] = (
+    (0, 0, 0),         # black
+    (80, 80, 80),      # dark grey
+    (150, 150, 150),   # mid grey
+    (220, 50, 47),     # red
+    (60, 170, 60),     # green
+    (50, 80, 220),     # blue
+    (245, 130, 32),    # orange
+    (150, 60, 200),    # purple
+    (240, 120, 180),   # pink
+    (255, 200, 0),     # yellow
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -35,7 +55,7 @@ class Brush:
         min_w: float = 0.5,
         max_w: float = 32.0,
     ) -> None:
-        self.color = color
+        self.color = tuple(color)
         self.base = base
         self.gain = gain
         self.min_w = min_w
@@ -46,9 +66,22 @@ class Brush:
         return max(self.min_w, min(self.max_w, w))
 
 
-PEN = Brush(color=(0, 0, 0), base=1.5, gain=10.0, min_w=0.6, max_w=28.0)
-HIGHLIGHTER = Brush(color=(255, 224, 64), base=12.0, gain=10.0, min_w=10.0, max_w=48.0)
-ERASER = Brush(color=(255, 255, 255), base=12.0, gain=24.0, min_w=10.0, max_w=64.0)
+def make_brush(color, size: float, pressure_sensitive: bool = True) -> Brush:
+    """Build a brush whose MAX width is ``size`` px.
+
+    With pressure sensitivity: width ramps from size*0.2 to size.
+    Without: constant width == size.
+    """
+    size = max(0.5, float(size))
+    if pressure_sensitive:
+        return Brush(
+            color=color,
+            base=size * 0.2,
+            gain=size * 0.8,
+            min_w=max(0.5, size * 0.15),
+            max_w=size,
+        )
+    return Brush(color=color, base=size, gain=0.0, min_w=size, max_w=size)
 
 
 # --------------------------------------------------------------------------- #
@@ -63,9 +96,74 @@ class Canvas:
         self.image = Image.new("RGB", (width, height), bg)
         self.lock = threading.RLock()
         self._draw = ImageDraw.Draw(self.image)
-        self.brush: Brush = PEN
+
+        # user-tunable brush state
+        self._pen_color: Tuple[int, int, int] = (0, 0, 0)
+        self._pen_size: float = 8.0
+        self._eraser_size: float = 48.0
+        self._pressure_sensitive: bool = True
+
+        # current brush (pen or eraser depending on last input event)
+        self._is_eraser: bool = False
+        self.brush: Brush = self._pen_brush()
+
         self._dirty: Optional[Box] = None
         self.version: int = 0
+
+    # -- brush construction --------------------------------------------- #
+
+    def _pen_brush(self) -> Brush:
+        return make_brush(self._pen_color, self._pen_size,
+                          self._pressure_sensitive)
+
+    def _eraser_brush(self) -> Brush:
+        # Eraser paints with the background colour. That works for the common
+        # white-background case and degrades gracefully on tinted backgrounds.
+        return make_brush(self.bg, self._eraser_size,
+                          self._pressure_sensitive)
+
+    # -- public brush API ------------------------------------------------ #
+
+    def set_brush_for(self, eraser: bool) -> None:
+        """Select the pen or eraser brush. Called by the input reader."""
+        self._is_eraser = bool(eraser)
+        self.brush = self._eraser_brush() if eraser else self._pen_brush()
+
+    def set_pen_color(self, color: Tuple[int, int, int]) -> None:
+        self._pen_color = tuple(color)
+        if not self._is_eraser:
+            self.brush = self._pen_brush()
+
+    def set_pen_size(self, size: float) -> None:
+        self._pen_size = max(0.5, float(size))
+        if not self._is_eraser:
+            self.brush = self._pen_brush()
+
+    def set_eraser_size(self, size: float) -> None:
+        self._eraser_size = max(0.5, float(size))
+        if self._is_eraser:
+            self.brush = self._eraser_brush()
+
+    def set_pressure_sensitive(self, on: bool) -> None:
+        self._pressure_sensitive = bool(on)
+        self.brush = (self._eraser_brush() if self._is_eraser
+                      else self._pen_brush())
+
+    @property
+    def pen_color(self) -> Tuple[int, int, int]:
+        return self._pen_color
+
+    @property
+    def pen_size(self) -> float:
+        return self._pen_size
+
+    @property
+    def eraser_size(self) -> float:
+        return self._eraser_size
+
+    @property
+    def pressure_sensitive(self) -> bool:
+        return self._pressure_sensitive
 
     # -- dirty tracking -------------------------------------------------- #
 
@@ -91,6 +189,7 @@ class Canvas:
     # -- drawing -------------------------------------------------------- #
 
     def set_brush(self, brush: Brush) -> None:
+        """Direct brush override (advanced use; prefer set_* methods)."""
         self.brush = brush
 
     def draw_segment(self, x0: float, y0: float, x1: float, y1: float,
@@ -101,7 +200,6 @@ class Canvas:
         with self.lock:
             self._draw.line([(x0, y0), (x1, y1)], fill=b.color,
                             width=max(1, int(round(w))))
-            # round caps
             self._draw.ellipse([x0 - r, y0 - r, x0 + r, y0 + r], fill=b.color)
             self._draw.ellipse([x1 - r, y1 - r, x1 + r, y1 + r], fill=b.color)
             x_lo = int(min(x0, x1) - r - 2)
@@ -150,21 +248,22 @@ class Canvas:
 
     def render_preview(self, pw: int, ph: int, mode: str = "fit") -> Image.Image:
         with self.lock:
+            if (pw, ph) == self.image.size and mode == "fit":
+                return self.image.convert("L")     # was: .copy()
             img = self.image
             iw, ih = img.size
             if mode == "stretch":
-                return img.resize((pw, ph), LANCZOS)
+                return img.resize((pw, ph), BILINEAR).convert("L")
             if mode == "crop":
                 s = max(pw / iw, ph / ih)
                 nw, nh = int(round(iw * s)), int(round(ih * s))
-                r = img.resize((nw, nh), LANCZOS)
+                r = img.resize((nw, nh), BILINEAR)
                 l = (nw - pw) // 2
                 t = (nh - ph) // 2
-                return r.crop((l, t, l + pw, t + ph))
-            # "fit"
+                return r.crop((l, t, l + pw, t + ph)).convert("L")
             s = min(pw / iw, ph / ih)
             nw, nh = int(round(iw * s)), int(round(ih * s))
-            r = img.resize((nw, nh), LANCZOS)
-            out = Image.new("RGB", (pw, ph), (255, 255, 255))
+            r = img.resize((nw, nh), BILINEAR)
+            out = Image.new("L", (pw, ph), 255)    # was "RGB", (255,255,255)
             out.paste(r, ((pw - nw) // 2, (ph - nh) // 2))
             return out

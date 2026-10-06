@@ -75,18 +75,10 @@ class KindleLink:
 
         env = os.environ.copy()
         password = self.cfg.password or os.environ.get("KINDLE_SSH_PASSWORD")
-        if password:
-            if shutil.which("sshpass"):
-                argv = ["sshpass", "-e"] + argv
-                env["SSHPASS"] = password
-                log.info("establishing SSH ControlMaster (sshpass) to %s",
-                         self._target)
-            else:
-                log.warning(
-                    "password supplied but sshpass not found; "
-                    "you will be prompted interactively"
-                )
-                log.info("establishing SSH ControlMaster to %s", self._target)
+        if password and shutil.which("sshpass"):
+            argv = ["sshpass", "-e"] + argv
+            env["SSHPASS"] = password
+            log.info("establishing SSH ControlMaster (sshpass) to %s", self._target)
         else:
             log.info("establishing SSH ControlMaster to %s "
                      "(you may be prompted for a password)", self._target)
@@ -110,7 +102,7 @@ class KindleLink:
             "-o", "ServerAliveInterval=15",
             "-o", "ServerAliveCountMax=3",
             "-o", f"ControlPath={self.control_path}",
-            "-o", "ControlMaster=no",           # must not try to become master
+            "-o", "ControlMaster=no",
             "-o", "ControlPersist=600",
             "-o", "StrictHostKeyChecking=accept-new",
             "-p", str(self.cfg.port),
@@ -122,13 +114,9 @@ class KindleLink:
             argv.append(remote_cmd)
         return argv
 
-    def run(
-        self,
-        remote_cmd: str,
-        data: Optional[bytes] = None,
-        timeout: Optional[float] = None,
-        check: bool = False,
-    ) -> subprocess.CompletedProcess:
+    def run(self, remote_cmd: str, data: Optional[bytes] = None,
+            timeout: Optional[float] = None, check: bool = False
+            ) -> subprocess.CompletedProcess:
         self.ensure_master()
         argv = self._argv(remote_cmd)
         log.debug("ssh run: %s", remote_cmd)
@@ -213,24 +201,21 @@ class KindleLink:
         y: int = 0,
         wf: Optional[str] = None,
         flash: bool = False,
-        no_clear: bool = True,   # kept for callers; ignored by design now
+        no_clear: bool = True,   # kept for API compat; not used
     ) -> None:
-        # Build the fbink argv.
-        # NOTE: the waveform flag is UPPERCASE -W (--waveform MODE).
-        # Lowercase -w is --wait and takes no argument; using it silently
-        # turns the waveform name into a STRING argument, which FBInk then
-        # prints INSTEAD of the image.
+        # NOTE: waveform flag is UPPERCASE -W (--waveform MODE).
+        # Lowercase -w is --wait; using it makes FBInk print the waveform
+        # name as a STRING and skip the image.
         parts: List[str] = [self.cfg.fbink, "-q"]
         if flash:
             parts.append("-f")
         if wf:
-            parts += ["-W", wf]                      # <-- uppercase W
+            parts += ["-W", wf]
         parts += ["-g", f"file={self.cfg.tmp_png},x={x},y={y}"]
-        # (No -b: we WANT every call to refresh the e-ink panel.)
 
-        # Upload the PNG and run fbink in ONE ssh round-trip.
-        cmd = f"cat > {shlex.quote(self.cfg.tmp_png)} && " + " ".join(
-            shlex.quote(p) for p in parts
+        cmd = (
+            f"cat > {shlex.quote(self.cfg.tmp_png)} && "
+            + " ".join(shlex.quote(a) for a in parts)
         )
         log.debug("fbink: %s", " ".join(parts))
         r = self.run(cmd, data=png_bytes, timeout=30)
@@ -238,35 +223,7 @@ class KindleLink:
             raise RuntimeError(
                 f"fbink failed: {r.stderr.decode('utf-8', 'replace')}"
             )
-        r = self.run(
-            f"cat > {shlex.quote(self.cfg.tmp_png)}",
-            data=png_bytes,
-            timeout=15,
-        )
-        if r.returncode != 0:
-            raise RuntimeError(
-                f"upload failed: {r.stderr.decode('utf-8', 'replace')}"
-            )
 
-        # NOTE: this FBInk build wants the waveform as a top-level flag
-        # (`-w GC16`), NOT as `wf=...` inside the `-g` image spec.
-        argv: List[str] = [self.cfg.fbink, "-q"]
-        if no_clear:
-            argv.append("-b")
-        if flash:
-            argv.append("-f")
-        if wf:
-            argv += ["-w", wf]
-        spec = f"file={self.cfg.tmp_png},x={x},y={y}"
-        argv += ["-g", spec]
-
-        cmd = " ".join(shlex.quote(a) for a in argv)
-        log.debug("fbink: %s", cmd)
-        r = self.run(cmd, timeout=20)
-        if r.returncode != 0:
-            raise RuntimeError(
-                f"fbink failed: {r.stderr.decode('utf-8', 'replace')}"
-            )
 
     def clear_screen(self) -> None:
         self.run(f"{self.cfg.fbink} -q -c -f")
