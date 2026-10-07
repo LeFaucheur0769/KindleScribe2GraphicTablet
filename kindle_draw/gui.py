@@ -1,241 +1,381 @@
-"""Optional Tkinter window showing the canvas and letting you tune the pen.
+"""Optional Qt6 (PySide6) window showing the canvas and letting you tune the pen.
 
-Modern dark theme, flat buttons, section headers. The window re-renders
-the canvas only when something actually changed (canvas version, zoom,
-or widget size), so it stays light on CPU while the streamer is running.
+Modern dark theme, native HiDPI, smooth pan/zoom. The preview only
+re-renders when the canvas version, zoom level, or viewport size changed,
+so idle CPU stays near zero.
 """
 
 from __future__ import annotations
 
 import logging
-import tkinter as tk
-from tkinter import colorchooser, filedialog, ttk, font as tkfont
-from typing import Callable, Optional
+import sys
+from typing import Optional
 
-from PIL import Image, ImageTk
+from PIL import Image
+
+try:
+    from PySide6.QtCore import Qt, Signal
+    from PySide6.QtGui import (
+        QColor, QImage, QKeySequence, QPainter, QPen, QPixmap, QShortcut,
+    )
+    from PySide6.QtWidgets import (
+        QApplication, QCheckBox, QColorDialog, QFileDialog, QFrame,
+        QGraphicsPixmapItem, QGraphicsScene, QGraphicsView, QGridLayout,
+        QHBoxLayout, QLabel, QMainWindow, QPushButton, QRadioButton,
+        QSlider, QVBoxLayout, QWidget,
+    )
+except ImportError as exc:  # pragma: no cover
+    raise ImportError(
+        "kindle_draw.gui requires PySide6. Install with:\n"
+        "    pip install PySide6\n"
+        f"(import error: {exc})"
+    ) from exc
 
 from .canvas import PALETTE
 
 log = logging.getLogger(__name__)
-
-try:
-    LANCZOS = Image.Resampling.LANCZOS
-except AttributeError:
-    LANCZOS = Image.LANCZOS
 
 
 # --------------------------------------------------------------------------- #
 # Palette                                                                    #
 # --------------------------------------------------------------------------- #
 
-BG_MAIN       = "#1a1a1c"
-BG_SIDEBAR    = "#232326"
-BG_CARD       = "#2a2a2e"
-BG_INPUT      = "#2f2f34"
-BG_HOVER      = "#3a3a42"
-BG_ACTIVE     = "#45454f"
-FG_PRIMARY    = "#e8e8ec"
-FG_SECONDARY  = "#9a9aa6"
-FG_MUTED      = "#6a6a76"
-ACCENT        = "#5b8cff"
-ACCENT_HOVER  = "#7ba3ff"
-ACCENT_SOFT   = "#3a4a7a"
-SEPARATOR     = "#2e2e34"
+BG_WINDOW      = "#1a1a1c"
+BG_VIEWPORT    = "#141416"
+BG_SIDEBAR     = "#232326"
+BG_INPUT       = "#2f2f34"
+BG_INPUT_HOVER = "#3a3a42"
+BG_INPUT_PRESS = "#45454f"
+FG_PRIMARY     = "#e8e8ec"
+FG_SECONDARY   = "#9a9aa6"
+FG_MUTED       = "#6a6a76"
+ACCENT         = "#5b8cff"
+ACCENT_HOVER   = "#7ba3ff"
+SEPARATOR      = "#2e2e34"
+
+
+_QSS = f"""
+QWidget {{
+    background-color: {BG_WINDOW};
+    color: {FG_PRIMARY};
+    font-family: "Inter", "SF Pro Text", "Segoe UI", "Cantarell",
+                 "Ubuntu", "Noto Sans", "DejaVu Sans", sans-serif;
+    font-size: 10pt;
+}}
+
+QMainWindow {{
+    background-color: {BG_WINDOW};
+}}
+
+QFrame#sidebar {{
+    background-color: {BG_SIDEBAR};
+    border-left: 1px solid {SEPARATOR};
+}}
+
+QLabel#titleLabel {{
+    color: {FG_PRIMARY};
+    font-size: 15pt;
+    font-weight: 700;
+}}
+
+QLabel#subtitle {{
+    color: {FG_MUTED};
+    font-size: 8pt;
+}}
+
+QLabel#sectionHeader {{
+    color: {FG_MUTED};
+    font-size: 8pt;
+    font-weight: 700;
+    letter-spacing: 1px;
+}}
+
+QFrame#sectionRule {{
+    background-color: {SEPARATOR};
+    min-height: 1px;
+    max-height: 1px;
+}}
+
+QLabel#valueLabel {{
+    color: {FG_SECONDARY};
+    font-family: "JetBrains Mono", "Consolas", "DejaVu Sans Mono", monospace;
+    font-size: 8pt;
+}}
+
+QLabel#statusLabel {{
+    color: {FG_MUTED};
+    font-family: "JetBrains Mono", "Consolas", "DejaVu Sans Mono", monospace;
+    font-size: 8pt;
+}}
+
+QPushButton {{
+    background-color: {BG_INPUT};
+    color: {FG_PRIMARY};
+    border: none;
+    border-radius: 6px;
+    padding: 7px 12px;
+    text-align: left;
+}}
+
+QPushButton:hover {{
+    background-color: {BG_INPUT_HOVER};
+}}
+
+QPushButton:pressed {{
+    background-color: {BG_INPUT_PRESS};
+}}
+
+QPushButton#nav {{
+    background-color: {BG_INPUT};
+    padding: 4px 10px;
+    font-size: 12pt;
+    text-align: center;
+    min-width: 32px;
+}}
+
+QPushButton#nav:hover {{
+    background-color: {BG_INPUT_HOVER};
+}}
+
+QSlider::groove:horizontal {{
+    background: {BG_INPUT};
+    height: 4px;
+    border-radius: 2px;
+}}
+
+QSlider::sub-page:horizontal {{
+    background: {ACCENT};
+    height: 4px;
+    border-radius: 2px;
+}}
+
+QSlider::handle:horizontal {{
+    background: {ACCENT};
+    width: 14px;
+    margin: -5px 0;
+    border-radius: 7px;
+}}
+
+QSlider::handle:horizontal:hover {{
+    background: {ACCENT_HOVER};
+}}
+
+QCheckBox, QRadioButton {{
+    color: {FG_PRIMARY};
+    spacing: 8px;
+}}
+
+QCheckBox::indicator {{
+    width: 15px;
+    height: 15px;
+    border-radius: 4px;
+    background: {BG_INPUT};
+    border: 1px solid {SEPARATOR};
+}}
+
+QCheckBox::indicator:hover {{
+    background: {BG_INPUT_HOVER};
+}}
+
+QCheckBox::indicator:checked {{
+    background: {ACCENT};
+    border: 1px solid {ACCENT};
+}}
+
+QRadioButton::indicator {{
+    width: 13px;
+    height: 13px;
+    border-radius: 7px;
+    background: {BG_INPUT};
+    border: 1px solid {SEPARATOR};
+}}
+
+QRadioButton::indicator:hover {{
+    background: {BG_INPUT_HOVER};
+}}
+
+QRadioButton::indicator:checked {{
+    background: {ACCENT};
+    border: 1px solid {ACCENT};
+}}
+
+QGraphicsView {{
+    background-color: {BG_VIEWPORT};
+    border: none;
+}}
+
+QScrollBar:vertical, QScrollBar:horizontal {{
+    background: {BG_VIEWPORT};
+    width: 10px;
+    height: 10px;
+    border: none;
+    margin: 0;
+}}
+
+QScrollBar::handle:vertical, QScrollBar::handle:horizontal {{
+    background: {BG_INPUT};
+    border-radius: 5px;
+    min-height: 24px;
+    min-width: 24px;
+}}
+
+QScrollBar::handle:hover {{
+    background: {BG_INPUT_HOVER};
+}}
+
+QScrollBar::add-line, QScrollBar::sub-line {{
+    height: 0;
+    width: 0;
+    border: none;
+    background: none;
+}}
+
+QScrollBar::add-page, QScrollBar::sub-page {{
+    background: none;
+}}
+"""
 
 
 # --------------------------------------------------------------------------- #
-# Fonts                                                                      #
+# Helpers                                                                    #
 # --------------------------------------------------------------------------- #
 
-def _pick_font(candidates, fallback="TkDefaultFont"):
-    try:
-        families = set(tkfont.families())
-    except Exception:
-        return fallback
-    for name in candidates:
-        if name in families:
-            return name
-    return fallback
-
-
-_UI_FAMILY = _pick_font([
-    "Inter", "SF Pro Text", "Segoe UI Variable", "Segoe UI",
-    "Cantarell", "Ubuntu", "Noto Sans", "DejaVu Sans", "Helvetica",
-])
-_MONO_FAMILY = _pick_font([
-    "JetBrains Mono", "SF Mono", "Cascadia Mono", "Consolas", "Menlo",
-    "DejaVu Sans Mono", "Courier New", "Courier",
-])
-
-
-def _f(size: int, weight: str = "normal"):
-    return (_UI_FAMILY, size, weight)
-
-
-def _fm(size: int, weight: str = "normal"):
-    return (_MONO_FAMILY, size, weight)
+def _pil_to_pixmap(img: Image.Image) -> QPixmap:
+    if img.mode != "RGB":
+        img = img.convert("RGB")
+    w, h = img.size
+    data = img.tobytes("raw", "RGB")
+    qimage = QImage(data, w, h, w * 3, QImage.Format_RGB888).copy()
+    return QPixmap.fromImage(qimage)
 
 
 # --------------------------------------------------------------------------- #
-# ttk style configuration                                                    #
+# Swatch                                                                     #
 # --------------------------------------------------------------------------- #
 
-def _configure_ttk(root: tk.Tk) -> None:
-    style = ttk.Style(root)
-    try:
-        style.theme_use("clam")
-    except tk.TclError:
-        pass
+class Swatch(QWidget):
+    clicked = Signal(tuple)
 
-    style.configure(
-        "Modern.Horizontal.TScale",
-        background=BG_SIDEBAR,
-        troughcolor=BG_INPUT,
-        bordercolor=BG_SIDEBAR,
-        lightcolor=ACCENT,
-        darkcolor=ACCENT,
-        sliderrelief="flat",
-        gripcount=0,
-        troughrelief="flat",
-    )
-    style.map(
-        "Modern.Horizontal.TScale",
-        background=[("active", BG_SIDEBAR)],
-        lightcolor=[("active", ACCENT_HOVER)],
-        darkcolor=[("active", ACCENT_HOVER)],
-    )
-
-    style.configure(
-        "Modern.TRadiobutton",
-        background=BG_SIDEBAR,
-        foreground=FG_PRIMARY,
-        focuscolor=BG_SIDEBAR,
-        font=_f(10),
-        indicatorcolor=BG_INPUT,
-        indicatorrelief="flat",
-        bordercolor=BG_SIDEBAR,
-    )
-    style.map(
-        "Modern.TRadiobutton",
-        background=[("active", BG_SIDEBAR)],
-        foreground=[("selected", ACCENT), ("active", ACCENT_HOVER)],
-        indicatorcolor=[("selected", ACCENT), ("pressed", ACCENT_HOVER)],
-    )
-
-    style.configure(
-        "Modern.TCheckbutton",
-        background=BG_SIDEBAR,
-        foreground=FG_PRIMARY,
-        focuscolor=BG_SIDEBAR,
-        font=_f(10),
-        indicatorcolor=BG_INPUT,
-        indicatorrelief="flat",
-    )
-    style.map(
-        "Modern.TCheckbutton",
-        background=[("active", BG_SIDEBAR)],
-        foreground=[("selected", ACCENT), ("active", ACCENT_HOVER)],
-        indicatorcolor=[("selected", ACCENT), ("pressed", ACCENT_HOVER)],
-    )
-
-    style.configure("Modern.TSeparator", background=SEPARATOR)
-
-
-# --------------------------------------------------------------------------- #
-# Small widgets                                                              #
-# --------------------------------------------------------------------------- #
-
-class FlatButton(tk.Frame):
-    """A flat button with a hover state."""
-
-    def __init__(self, parent, text: str, command: Callable[[], None],
-                 *, accent: bool = False, font=None, **kw):
-        bg = ACCENT if accent else BG_INPUT
-        bg_hover = ACCENT_HOVER if accent else BG_HOVER
-        fg = "#ffffff" if accent else FG_PRIMARY
-
-        super().__init__(parent, bg=bg, cursor="hand2",
-                         highlightthickness=0, bd=0, **kw)
-        self._bg = bg
-        self._bg_hover = bg_hover
-        self._bg_active = BG_ACTIVE
-        self._command = command
-
-        self._label = tk.Label(self, text=text, bg=bg, fg=fg,
-                               font=font or _f(10),
-                               padx=12, pady=7, anchor="w")
-        self._label.pack(fill="x")
-
-        for w in (self, self._label):
-            w.bind("<Enter>", self._on_enter)
-            w.bind("<Leave>", self._on_leave)
-            w.bind("<Button-1>", self._on_press)
-            w.bind("<ButtonRelease-1>", self._on_release)
-
-    def _set_bg(self, colour):
-        self.configure(bg=colour)
-        self._label.configure(bg=colour)
-
-    def _on_enter(self, _e):
-        self._set_bg(self._bg_hover)
-
-    def _on_leave(self, _e):
-        self._set_bg(self._bg)
-
-    def _on_press(self, _e):
-        self._set_bg(self._bg_active)
-
-    def _on_release(self, e):
-        # Only fire if the release happened inside the widget.
-        x, y = e.x_root, e.y_root
-        wx, wy = self.winfo_rootx(), self.winfo_rooty()
-        ww, wh = self.winfo_width(), self.winfo_height()
-        inside = wx <= x < wx + ww and wy <= y < wy + wh
-        self._set_bg(self._bg_hover if inside else self._bg)
-        if inside and self._command:
-            self._command()
-
-
-class SectionHeader(tk.Frame):
-    """Small uppercase label with a thin rule below it."""
-
-    def __init__(self, parent, text: str, **kw):
-        super().__init__(parent, bg=BG_SIDEBAR, **kw)
-        tk.Label(self, text=text.upper(), bg=BG_SIDEBAR,
-                 fg=FG_MUTED, font=_f(9, "bold"),
-                 anchor="w").pack(fill="x")
-        tk.Frame(self, bg=SEPARATOR, height=1).pack(fill="x", pady=(4, 0))
-
-
-class Swatch(tk.Frame):
-    """A colour swatch. Click selects; highlight shows current selection."""
-
-    def __init__(self, parent, rgb, command, size: int = 26):
+    def __init__(self, rgb, size: int = 26):
+        super().__init__()
         self.rgb = tuple(rgb)
-        self._command = command
         self._size = size
         self._selected = False
-
-        super().__init__(parent, bg=BG_SIDEBAR, bd=0,
-                         highlightthickness=2,
-                         highlightbackground=BG_SIDEBAR,
-                         highlightcolor=BG_SIDEBAR)
-        hexcolor = "#%02x%02x%02x" % self.rgb
-        self._inner = tk.Frame(self, bg=hexcolor, cursor="hand2",
-                               width=size, height=size, bd=0,
-                               highlightthickness=0)
-        self._inner.pack(padx=2, pady=2)
-        self._inner.pack_propagate(False)
-
-        for w in (self._inner,):
-            w.bind("<Button-1>", lambda e: self._command(self.rgb))
+        self.setFixedSize(size, size)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setToolTip("#%02x%02x%02x" % self.rgb)
 
     def set_selected(self, yes: bool) -> None:
         if yes == self._selected:
             return
         self._selected = yes
-        colour = ACCENT if yes else BG_SIDEBAR
-        self.configure(highlightbackground=colour, highlightcolor=colour)
+        self.update()
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.LeftButton:
+            self.clicked.emit(self.rgb)
+
+    def paintEvent(self, event) -> None:
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        if self._selected:
+            p.setPen(QPen(QColor(ACCENT), 2))
+            p.setBrush(Qt.NoBrush)
+            p.drawRoundedRect(self.rect().adjusted(0, 0, -1, -1), 6, 6)
+            inner = self.rect().adjusted(3, 3, -3, -3)
+        else:
+            inner = self.rect().adjusted(2, 2, -2, -2)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(*self.rgb))
+        p.drawRoundedRect(inner, 4, 4)
+
+
+# --------------------------------------------------------------------------- #
+# Canvas view                                                                #
+# --------------------------------------------------------------------------- #
+
+class CanvasView(QGraphicsView):
+    """Zoomable, pannable preview of the Pillow canvas."""
+
+    def __init__(self, pages):
+        super().__init__()
+        self.pages = pages
+        self._scene = QGraphicsScene(self)
+        self.setScene(self._scene)
+        self._pixitem = QGraphicsPixmapItem()
+        self._scene.addItem(self._pixitem)
+
+        self.setRenderHints(QPainter.Antialiasing |
+                            QPainter.SmoothPixmapTransform)
+        self.setDragMode(QGraphicsView.ScrollHandDrag)
+        self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.setFrameShape(QFrame.NoFrame)
+
+        self._scale_mode = "fit"
+        self._explicit_scale = 1.0
+        self._effective_scale = 1.0
+        self._last_key = None
+
+    # -- API ------------------------------------------------------------ #
+
+    def set_scale_mode(self, mode: str) -> None:
+        self._scale_mode = mode
+        if mode != "fit":
+            try:
+                self._explicit_scale = float(mode)
+            except ValueError:
+                self._explicit_scale = 1.0
+        self._last_key = None
+        self.refresh()
+
+    def zoom_by(self, factor: float) -> None:
+        new_scale = max(0.05, min(8.0, self._effective_scale * factor))
+        self.set_scale_mode(f"{new_scale:.4f}")
+
+    def refresh(self) -> None:
+        canvas = self.pages.current()
+
+        vw = max(1, self.viewport().width())
+        vh = max(1, self.viewport().height())
+
+        if self._scale_mode == "fit":
+            scale = min(vw / canvas.width, vh / canvas.height) * 0.94
+        else:
+            scale = self._explicit_scale
+        self._effective_scale = scale
+
+        key = (canvas.version, round(scale, 6), id(canvas))
+        if key == self._last_key:
+            return
+        self._last_key = key
+
+        target_w = max(1, int(canvas.width * scale))
+        target_h = max(1, int(canvas.height * scale))
+        img = canvas.snapshot().resize((target_w, target_h), Image.LANCZOS)
+        pm = _pil_to_pixmap(img)
+        self._pixitem.setPixmap(pm)
+        self._scene.setSceneRect(0, 0, pm.width(), pm.height())
+        self.setSceneRect(self._scene.sceneRect())
+
+    def invalidate(self) -> None:
+        self._last_key = None
+
+    # -- events --------------------------------------------------------- #
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        if self._scale_mode == "fit":
+            self._last_key = None
+
+    def wheelEvent(self, event) -> None:
+        delta = event.angleDelta().y()
+        if delta == 0:
+            return
+        factor = 1.15 if delta > 0 else (1.0 / 1.15)
+        self.zoom_by(factor)
+        event.accept()
 
 
 # --------------------------------------------------------------------------- #
@@ -243,228 +383,294 @@ class Swatch(tk.Frame):
 # --------------------------------------------------------------------------- #
 
 class DrawingWindow:
-    SIDEBAR_WIDTH = 240
-    MARGIN = 60
+    SIDEBAR_WIDTH = 260
 
     def __init__(self, pages, streamer, injector=None) -> None:
         self.pages = pages
         self.streamer = streamer
         self.injector = injector
+        self._closed = False
 
-        self.root = tk.Tk()
-        self.root.title("Kindle Draw")
-        self.root.minsize(640, 480)
-        self.root.configure(bg=BG_MAIN)
+        # Own the QApplication. If one already exists (e.g. we're inside
+        # an existing Qt app), reuse it.
+        self.app = QApplication.instance()
+        if self.app is None:
+            self.app = QApplication(sys.argv)
+        self.app.setApplicationName("Kindle Draw")
+        self.app.setStyleSheet(_QSS)
 
-        _configure_ttk(self.root)
+        self.win = QMainWindow()
+        self.win.setWindowTitle("Kindle Draw")
+        self.win.setMinimumSize(720, 520)
 
-        sw = self.root.winfo_screenwidth()
-        sh = self.root.winfo_screenheight()
-        avail_w = max(500, sw - self.SIDEBAR_WIDTH - self.MARGIN)
-        avail_h = max(400, sh - self.MARGIN)
-        self.root.geometry(f"{avail_w + self.SIDEBAR_WIDTH}x{avail_h}")
+        screen = self.app.primaryScreen()
+        if screen is not None:
+            avail = screen.availableGeometry()
+            w = min(1400, max(900, avail.width() - 80))
+            h = min(900, max(600, avail.height() - 80))
+            self.win.resize(w, h)
 
-        # --- canvas viewport ------------------------------------------- #
-        viewport = tk.Frame(self.root, bg=BG_MAIN, bd=0)
-        viewport.pack(side="left", fill="both", expand=True)
+        # --- central layout ------------------------------------------- #
+        central = QWidget()
+        self.win.setCentralWidget(central)
+        root = QHBoxLayout(central)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
 
-        self._canvas_widget = tk.Canvas(
-            viewport, bg=BG_MAIN, highlightthickness=0, bd=0,
-        )
-        self._canvas_widget.pack(fill="both", expand=True)
+        self.canvas_view = CanvasView(pages)
+        root.addWidget(self.canvas_view, 1)
 
-        # --- sidebar ---------------------------------------------------- #
-        side = tk.Frame(self.root, width=self.SIDEBAR_WIDTH, bg=BG_SIDEBAR)
-        side.pack(side="right", fill="y")
-        side.pack_propagate(False)
+        sidebar = QFrame()
+        sidebar.setObjectName("sidebar")
+        sidebar.setFixedWidth(self.SIDEBAR_WIDTH)
+        root.addWidget(sidebar)
 
-        # Inner padded container
-        inner = tk.Frame(side, bg=BG_SIDEBAR)
-        inner.pack(fill="both", expand=True, padx=14, pady=14)
+        side = QVBoxLayout(sidebar)
+        side.setContentsMargins(16, 16, 16, 12)
+        side.setSpacing(0)
 
-        # Title block
-        tk.Label(inner, text="Kindle Draw", bg=BG_SIDEBAR, fg=FG_PRIMARY,
-                 font=_f(15, "bold"), anchor="w").pack(fill="x")
-        self._title_sub = tk.Label(inner, text="", bg=BG_SIDEBAR,
-                                   fg=FG_MUTED, font=_fm(9), anchor="w")
-        self._title_sub.pack(fill="x", pady=(2, 12))
+        # --- title ---------------------------------------------------- #
+        title = QLabel("Kindle Draw")
+        title.setObjectName("titleLabel")
+        side.addWidget(title)
 
-        # --- Pen section ------------------------------------------------ #
-        SectionHeader(inner, "Pen").pack(fill="x", pady=(0, 8))
+        self._subtitle = QLabel("")
+        self._subtitle.setObjectName("subtitle")
+        side.addWidget(self._subtitle)
+        side.addSpacing(14)
 
-        # Colour swatches grid
-        swatch_grid = tk.Frame(inner, bg=BG_SIDEBAR)
-        swatch_grid.pack(fill="x", pady=(0, 6))
+        # --- Pen section ---------------------------------------------- #
+        self._section(side, "Pen")
+
+        swatch_grid = QGridLayout()
+        swatch_grid.setContentsMargins(0, 0, 0, 0)
+        swatch_grid.setSpacing(4)
         self._swatches = []
-        cols = 5
         for i, rgb in enumerate(PALETTE):
-            s = Swatch(swatch_grid, rgb, self._set_color)
-            s.grid(row=i // cols, column=i % cols, padx=(0, 4), pady=(0, 4))
+            s = Swatch(rgb)
+            s.clicked.connect(self._set_color)
+            swatch_grid.addWidget(s, i // 5, i % 5)
             self._swatches.append(s)
+        side.addLayout(swatch_grid)
+        side.addSpacing(8)
 
-        # Custom colour + current hex
-        colour_row = tk.Frame(inner, bg=BG_SIDEBAR)
-        colour_row.pack(fill="x", pady=(4, 8))
-        FlatButton(colour_row, "Custom colour…", self._pick_color,
-                   font=_f(9)).pack(side="left", fill="x", expand=True)
-        self._color_label = tk.Label(colour_row, text="",
-                                     bg=BG_SIDEBAR, fg=FG_SECONDARY,
-                                     font=_fm(9))
-        self._color_label.pack(side="right", padx=(8, 0))
+        colour_row = QWidget()
+        cr = QHBoxLayout(colour_row)
+        cr.setContentsMargins(0, 0, 0, 0)
+        cr.setSpacing(8)
+        custom = QPushButton("Custom colour…")
+        custom.clicked.connect(self._pick_color)
+        cr.addWidget(custom, 1)
+        self._color_label = QLabel("")
+        self._color_label.setObjectName("valueLabel")
+        cr.addWidget(self._color_label)
+        side.addWidget(colour_row)
+        side.addSpacing(12)
 
-        # Pen size
-        pen_size_head = tk.Frame(inner, bg=BG_SIDEBAR)
-        pen_size_head.pack(fill="x", pady=(6, 0))
-        tk.Label(pen_size_head, text="Size", bg=BG_SIDEBAR,
-                 fg=FG_SECONDARY, font=_f(10)).pack(side="left")
-        self._pen_size_label = tk.Label(pen_size_head, text="",
-                                        bg=BG_SIDEBAR, fg=FG_SECONDARY,
-                                        font=_fm(9))
-        self._pen_size_label.pack(side="right")
 
-        self._pen_size_var = tk.DoubleVar(value=8.0)
-        ttk.Scale(inner, from_=1.0, to=60.0,
-                  variable=self._pen_size_var,
-                  command=self._on_pen_size,
-                  style="Modern.Horizontal.TScale").pack(fill="x", pady=(4, 0))
+        pen_head = QWidget()
+        ph = QHBoxLayout(pen_head)
+        ph.setContentsMargins(0, 0, 0, 0)
+        ph.addWidget(self._small("Size"))
+        ph.addStretch(1)
+        self._pen_size_label = QLabel("")
+        self._pen_size_label.setObjectName("valueLabel")
+        ph.addWidget(self._pen_size_label)
+        side.addWidget(pen_head)
 
-        # --- Eraser section --------------------------------------------- #
-        SectionHeader(inner, "Eraser").pack(fill="x", pady=(16, 8))
+        self._pen_size_slider = QSlider(Qt.Horizontal)
+        self._pen_size_slider.setRange(5, 600)   # 0.5 .. 60.0 px
+        self._pen_size_slider.setValue(80)
+        self._pen_size_slider.valueChanged.connect(self._on_pen_size)
+        side.addWidget(self._pen_size_slider)
+        side.addSpacing(14)
 
-        eraser_head = tk.Frame(inner, bg=BG_SIDEBAR)
-        eraser_head.pack(fill="x")
-        tk.Label(eraser_head, text="Size", bg=BG_SIDEBAR,
-                 fg=FG_SECONDARY, font=_f(10)).pack(side="left")
-        self._eraser_size_label = tk.Label(eraser_head, text="",
-                                           bg=BG_SIDEBAR, fg=FG_SECONDARY,
-                                           font=_fm(9))
-        self._eraser_size_label.pack(side="right")
+        # --- Eraser section ------------------------------------------- #
+        self._section(side, "Eraser")
 
-        self._eraser_size_var = tk.DoubleVar(value=48.0)
-        ttk.Scale(inner, from_=2.0, to=200.0,
-                  variable=self._eraser_size_var,
-                  command=self._on_eraser_size,
-                  style="Modern.Horizontal.TScale").pack(fill="x", pady=(4, 0))
+        eraser_head = QWidget()
+        eh = QHBoxLayout(eraser_head)
+        eh.setContentsMargins(0, 0, 0, 0)
+        eh.addWidget(self._small("Size"))
+        eh.addStretch(1)
+        self._eraser_size_label = QLabel("")
+        self._eraser_size_label.setObjectName("valueLabel")
+        eh.addWidget(self._eraser_size_label)
+        side.addWidget(eraser_head)
 
-        # --- Behaviour section ------------------------------------------ #
-        SectionHeader(inner, "Behaviour").pack(fill="x", pady=(16, 8))
+        self._eraser_size_slider = QSlider(Qt.Horizontal)
+        self._eraser_size_slider.setRange(20, 2000)  # 2 .. 200 px
+        self._eraser_size_slider.setValue(480)
+        self._eraser_size_slider.valueChanged.connect(self._on_eraser_size)
+        side.addWidget(self._eraser_size_slider)
+        side.addSpacing(14)
 
-        self._pressure_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(inner, text="Pressure sensitive",
-                        variable=self._pressure_var,
-                        command=self._on_pressure_toggle,
-                        style="Modern.TCheckbutton").pack(
-            anchor="w", pady=(0, 4))
+        # --- Behaviour ------------------------------------------------ #
+        self._section(side, "Behaviour")
 
-        self._sticky_var: Optional[tk.BooleanVar] = None
+        self._pressure_cb = QCheckBox("Pressure sensitive")
+        self._pressure_cb.setChecked(True)
+        self._pressure_cb.toggled.connect(self._on_pressure_toggle)
+        side.addWidget(self._pressure_cb)
+
+        self._sticky_cb: Optional[QCheckBox] = None
         if injector is not None and hasattr(injector, "toggle_sticky_click"):
-            self._sticky_var = tk.BooleanVar(
-                value=bool(getattr(injector, "sticky_click", False)))
-            ttk.Checkbutton(inner, text="Sticky click (barrel button)",
-                            variable=self._sticky_var,
-                            command=self._on_sticky_toggle,
-                            style="Modern.TCheckbutton").pack(anchor="w")
+            self._sticky_cb = QCheckBox("Sticky click (barrel button)")
+            self._sticky_cb.setChecked(
+                bool(getattr(injector, "sticky_click", False)))
+            self._sticky_cb.toggled.connect(self._on_sticky_toggle)
+            side.addWidget(self._sticky_cb)
 
-        # --- View section ----------------------------------------------- #
-        SectionHeader(inner, "View").pack(fill="x", pady=(16, 8))
+        side.addSpacing(14)
 
-        self._scale_var = tk.StringVar(value="fit")
+        # --- View ----------------------------------------------------- #
+        self._section(side, "View")
+
+        self._view_radios = []
         for text, val in (("Fit to window", "fit"),
                           ("100 %", "1.0"),
                           ("50 %", "0.5"),
                           ("25 %", "0.25")):
-            ttk.Radiobutton(inner, text=text, value=val,
-                            variable=self._scale_var,
-                            command=self._request_render,
-                            style="Modern.TRadiobutton").pack(
-                anchor="w", pady=1)
+            rb = QRadioButton(text)
+            rb.setProperty("scale_mode", val)
+            rb.toggled.connect(lambda on, v=val: self._on_scale_mode(on, v))
+            if val == "fit":
+                rb.setChecked(True)
+            side.addWidget(rb)
+            self._view_radios.append(rb)
 
-        # --- Actions section -------------------------------------------- #
-        SectionHeader(inner, "Actions").pack(fill="x", pady=(16, 8))
+        side.addSpacing(14)
 
-        FlatButton(inner, "Save PNG…", self._save_png).pack(
-            fill="x", pady=(0, 4))
-        FlatButton(inner, "Save PDF…", self._save_pdf).pack(
-            fill="x", pady=(0, 4))
-        FlatButton(inner, "Clear canvas", self._clear).pack(
-            fill="x", pady=(0, 4))
+        # --- Actions -------------------------------------------------- #
+        self._section(side, "Actions")
+        for text, cb in (("Save PNG…", self._save_png),
+                         ("Save PDF…", self._save_pdf),
+                         ("Clear canvas", self._clear)):
+            b = QPushButton(text)
+            b.clicked.connect(cb)
+            side.addWidget(b)
+            side.addSpacing(4)
 
-        # --- Pages section ---------------------------------------------- #
-        SectionHeader(inner, "Pages").pack(fill="x", pady=(16, 8))
+        side.addSpacing(10)
 
-        nav = tk.Frame(inner, bg=BG_SIDEBAR)
-        nav.pack(fill="x")
+        # --- Pages ---------------------------------------------------- #
+        self._section(side, "Pages")
 
-        def _nav_btn(text, cmd):
-            b = tk.Label(nav, text=text, bg=BG_INPUT, fg=FG_PRIMARY,
-                         font=_f(12), padx=10, pady=5, cursor="hand2")
-            b.bind("<Enter>", lambda e: b.configure(bg=BG_HOVER))
-            b.bind("<Leave>", lambda e: b.configure(bg=BG_INPUT))
-            b.bind("<Button-1>", lambda e: cmd())
-            return b
+        nav_row = QWidget()
+        nav = QHBoxLayout(nav_row)
+        nav.setContentsMargins(0, 0, 0, 0)
+        nav.setSpacing(6)
 
-        _nav_btn("←", self._prev_page).pack(side="left")
-        _nav_btn("+", self._new_page).pack(side="left", padx=4)
-        _nav_btn("→", self._next_page).pack(side="left")
+        prev_btn = QPushButton("←")
+        prev_btn.setObjectName("nav")
+        prev_btn.clicked.connect(self._prev_page)
+        nav.addWidget(prev_btn)
 
-        self._page_label = tk.Label(inner, text="page 1 / 1",
-                                    bg=BG_SIDEBAR, fg=FG_MUTED,
-                                    font=_fm(9))
-        self._page_label.pack(pady=(6, 0))
+        new_btn = QPushButton("+")
+        new_btn.setObjectName("nav")
+        new_btn.clicked.connect(self._new_page)
+        nav.addWidget(new_btn)
 
-        # --- status footer ---------------------------------------------- #
-        self._status = tk.Label(side, text="", bg=BG_SIDEBAR,
-                                fg=FG_MUTED, font=_fm(8),
-                                anchor="w", justify="left")
-        self._status.pack(side="bottom", fill="x", padx=14, pady=10)
+        next_btn = QPushButton("→")
+        next_btn.setObjectName("nav")
+        next_btn.clicked.connect(self._next_page)
+        nav.addWidget(next_btn)
+        nav.addStretch(1)
+        side.addWidget(nav_row)
+        side.addSpacing(6)
 
-        # --- state ------------------------------------------------------ #
-        self._tk_img: Optional[ImageTk.PhotoImage] = None
-        self._effective_scale = 1.0
-        self._closed = False
-        self._render_pending = False
-        self._last_render_key = None
+        self._page_label = QLabel("page 1 / 1")
+        self._page_label.setObjectName("valueLabel")
+        side.addWidget(self._page_label)
 
-        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
-        self._canvas_widget.bind(
-            "<Configure>", lambda e: self._request_render())
+        side.addStretch(1)
 
-        # Zoom shortcuts
-        self.root.bind("<plus>",  lambda e: self._zoom_by(1.25))
-        self.root.bind("<equal>", lambda e: self._zoom_by(1.25))
-        self.root.bind("<minus>", lambda e: self._zoom_by(0.8))
-        self.root.bind("<0>",     lambda e: self._set_scale_mode("fit"))
-        self.root.bind("<1>",     lambda e: self._set_scale_mode("1.0"))
+        self._status = QLabel("")
+        self._status.setObjectName("statusLabel")
+        self._status.setWordWrap(True)
+        side.addWidget(self._status)
 
-        # Save shortcuts
-        self.root.bind("<Control-s>", lambda e: self._save_png())
-        self.root.bind("<Control-p>", lambda e: self._save_pdf())
-
-        # Page shortcuts
-        self.root.bind("<Prior>", lambda e: self._prev_page())
-        self.root.bind("<Next>",  lambda e: self._next_page())
+        # --- shortcuts ------------------------------------------------- #
+        self._install_shortcuts()
 
         self._sync_from_canvas()
+        self.canvas_view.refresh()
+        self._update_status()
+
+        # Actually map the window. Without this, the QMainWindow exists
+        # but never becomes visible.
+        self.win.show()
+        self.win.raise_()
+        self.win.activateWindow()
 
     # ------------------------------------------------------------------ #
-    # External API                                                       #
+    # Public API (called by app.py)                                      #
     # ------------------------------------------------------------------ #
 
     def tick(self) -> None:
         if self._closed:
             return
         try:
-            self._render()
-            self.root.update_idletasks()
-            self.root.update()
-        except tk.TclError:
+            self.canvas_view.refresh()
+            self._update_status()
+            self.app.processEvents()
+        except RuntimeError:
+            # Window was destroyed from underneath us.
             self._closed = True
 
     def close(self) -> None:
-        self._on_close()
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self.win.close()
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------ #
-    # Pen actions                                                        #
+    # Layout helpers                                                     #
+    # ------------------------------------------------------------------ #
+
+    def _small(self, text: str) -> QLabel:
+        lbl = QLabel(text)
+        lbl.setStyleSheet(f"color: {FG_SECONDARY}; font-size: 10pt;")
+        return lbl
+
+    def _section(self, layout: QVBoxLayout, text: str) -> None:
+        lbl = QLabel(text.upper())
+        lbl.setObjectName("sectionHeader")
+        layout.addWidget(lbl)
+        rule = QFrame()
+        rule.setObjectName("sectionRule")
+        layout.addSpacing(4)
+        layout.addWidget(rule)
+        layout.addSpacing(8)
+
+    def _install_shortcuts(self) -> None:
+        def sc(seq, cb):
+            s = QShortcut(QKeySequence(seq), self.win)
+            s.activated.connect(cb)
+            return s
+
+        sc("Ctrl+S", self._save_png)
+        sc("Ctrl+P", self._save_pdf)
+        sc("Ctrl+N", self._new_page)
+        sc("PageUp", self._prev_page)
+        sc("PageDown", self._next_page)
+        sc("+", lambda: self.canvas_view.zoom_by(1.25))
+        sc("=", lambda: self.canvas_view.zoom_by(1.25))
+        sc("-", lambda: self.canvas_view.zoom_by(0.8))
+        sc("0", lambda: self._select_view_radio("fit"))
+        sc("1", lambda: self._select_view_radio("1.0"))
+
+    def _select_view_radio(self, mode: str) -> None:
+        for rb in self._view_radios:
+            if rb.property("scale_mode") == mode:
+                rb.setChecked(True)
+                return
+
+    # ------------------------------------------------------------------ #
+    # Canvas / pen actions                                               #
     # ------------------------------------------------------------------ #
 
     def _current_canvas(self):
@@ -473,183 +679,128 @@ class DrawingWindow:
     def _set_color(self, rgb) -> None:
         self._current_canvas().set_pen_color(tuple(rgb))
         self._update_swatch_selection(tuple(rgb))
-        self._color_label.config(text="#%02x%02x%02x" % tuple(rgb))
+        self._color_label.setText("#%02x%02x%02x" % tuple(rgb))
 
     def _pick_color(self) -> None:
-        initial = "#%02x%02x%02x" % self._current_canvas().pen_color
-        rgb, _ = colorchooser.askcolor(color=initial, title="Pen colour")
-        if rgb:
-            self._set_color(tuple(int(c) for c in rgb))
+        cur = self._current_canvas().pen_color
+        col = QColorDialog.getColor(QColor(*cur), self.win, "Pen colour")
+        if col.isValid():
+            self._set_color((col.red(), col.green(), col.blue()))
 
-    def _update_swatch_selection(self, current_rgb) -> None:
+    def _update_swatch_selection(self, rgb) -> None:
         for s in self._swatches:
-            s.set_selected(s.rgb == tuple(current_rgb))
+            s.set_selected(s.rgb == tuple(rgb))
 
-    def _on_pen_size(self, _value) -> None:
-        v = float(self._pen_size_var.get())
-        self._current_canvas().set_pen_size(v)
-        self._pen_size_label.config(text=f"{v:.1f} px")
+    def _on_pen_size(self, value: int) -> None:
+        size = value / 10.0
+        self._current_canvas().set_pen_size(size)
+        self._pen_size_label.setText(f"{size:.1f} px")
 
-    def _on_eraser_size(self, _value) -> None:
-        v = float(self._eraser_size_var.get())
-        self._current_canvas().set_eraser_size(v)
-        self._eraser_size_label.config(text=f"{v:.1f} px")
+    def _on_eraser_size(self, value: int) -> None:
+        size = value / 10.0
+        self._current_canvas().set_eraser_size(size)
+        self._eraser_size_label.setText(f"{size:.1f} px")
 
-    def _on_pressure_toggle(self) -> None:
-        self._current_canvas().set_pressure_sensitive(
-            self._pressure_var.get())
+    def _on_pressure_toggle(self, on: bool) -> None:
+        self._current_canvas().set_pressure_sensitive(bool(on))
 
-    def _on_sticky_toggle(self) -> None:
-        if self.injector is None or self._sticky_var is None:
+    def _on_sticky_toggle(self, on: bool) -> None:
+        if self.injector is None:
             return
-        want = bool(self._sticky_var.get())
         try:
             if hasattr(self.injector, "set_sticky_click"):
-                self.injector.set_sticky_click(want)
+                self.injector.set_sticky_click(bool(on))
             elif hasattr(self.injector, "toggle_sticky_click"):
-                # Fallback if only toggle exists.
+                want = bool(on)
                 for _ in range(4):
-                    if bool(getattr(self.injector, "sticky_click", False)) == want:
+                    if bool(getattr(self.injector, "sticky_click",
+                                    False)) == want:
                         break
                     self.injector.toggle_sticky_click()
         except Exception:
             log.debug("sticky toggle failed", exc_info=True)
 
+    def _on_scale_mode(self, on: bool, mode: str) -> None:
+        if on:
+            self.canvas_view.set_scale_mode(mode)
+
     def _sync_from_canvas(self) -> None:
         c = self._current_canvas()
-        self._pen_size_var.set(c.pen_size)
-        self._eraser_size_var.set(c.eraser_size)
-        self._pressure_var.set(c.pressure_sensitive)
-        self._pen_size_label.config(text=f"{c.pen_size:.1f} px")
-        self._eraser_size_label.config(text=f"{c.eraser_size:.1f} px")
-        self._color_label.config(text="#%02x%02x%02x" % c.pen_color)
-        self._update_swatch_selection(c.pen_color)
 
-        if self._sticky_var is not None and self.injector is not None:
-            self._sticky_var.set(
+        for w in (self._pen_size_slider, self._eraser_size_slider,
+                  self._pressure_cb):
+            w.blockSignals(True)
+        self._pen_size_slider.setValue(int(round(c.pen_size * 10)))
+        self._eraser_size_slider.setValue(int(round(c.eraser_size * 10)))
+        self._pressure_cb.setChecked(bool(c.pressure_sensitive))
+        for w in (self._pen_size_slider, self._eraser_size_slider,
+                  self._pressure_cb):
+            w.blockSignals(False)
+
+        self._pen_size_label.setText(f"{c.pen_size:.1f} px")
+        self._eraser_size_label.setText(f"{c.eraser_size:.1f} px")
+        self._color_label.setText("#%02x%02x%02x" % tuple(c.pen_color))
+        self._update_swatch_selection(tuple(c.pen_color))
+
+        if self._sticky_cb is not None and self.injector is not None:
+            self._sticky_cb.blockSignals(True)
+            self._sticky_cb.setChecked(
                 bool(getattr(self.injector, "sticky_click", False)))
+            self._sticky_cb.blockSignals(False)
 
     # ------------------------------------------------------------------ #
-    # Zoom                                                                #
-    # ------------------------------------------------------------------ #
-
-    def _set_scale_mode(self, mode: str) -> None:
-        self._scale_var.set(mode)
-        self._request_render()
-
-    def _zoom_by(self, factor: float) -> None:
-        self._scale_var.set(f"{self._effective_scale * factor:.4f}")
-        self._request_render()
-
-    def _request_render(self) -> None:
-        self._render_pending = True
-        self._last_render_key = None   # force a redraw
-
-    def _compute_scale(self, src_w: int, src_h: int) -> float:
-        mode = self._scale_var.get()
-        if mode == "fit":
-            cw = max(1, self._canvas_widget.winfo_width())
-            ch = max(1, self._canvas_widget.winfo_height())
-            if cw <= 1 or ch <= 1:
-                cw = max(1, self.root.winfo_width() - self.SIDEBAR_WIDTH)
-                ch = max(1, self.root.winfo_height())
-            return max(0.01, min(cw / src_w, ch / src_h))
-        try:
-            return max(0.01, float(mode))
-        except ValueError:
-            return 1.0
-
-    # ------------------------------------------------------------------ #
-    # Render                                                              #
-    # ------------------------------------------------------------------ #
-
-    def _render(self) -> None:
-        canvas = self.pages.current()
-        src_w, src_h = canvas.width, canvas.height
-        scale = self._compute_scale(src_w, src_h)
-        self._effective_scale = scale
-
-        cw = max(1, self._canvas_widget.winfo_width())
-        ch = max(1, self._canvas_widget.winfo_height())
-
-        key = (canvas.version, round(scale, 6), cw, ch, id(canvas))
-        if key == self._last_render_key and self._tk_img is not None:
-            return
-        self._last_render_key = key
-
-        new_w = max(1, int(round(src_w * scale)))
-        new_h = max(1, int(round(src_h * scale)))
-
-        img = canvas.snapshot().resize((new_w, new_h), LANCZOS)
-        self._tk_img = ImageTk.PhotoImage(img)
-
-        x = max(0, (cw - new_w) // 2)
-        y = max(0, (ch - new_h) // 2)
-
-        self._canvas_widget.delete("all")
-
-        # Subtle outline so the page reads as an object on the dark backdrop.
-        pad = 1
-        self._canvas_widget.create_rectangle(
-            x - pad, y - pad, x + new_w + pad, y + new_h + pad,
-            fill="", outline="#3a3a44", width=1,
-        )
-        self._canvas_widget.create_image(x, y, anchor="nw",
-                                         image=self._tk_img)
-        self._canvas_widget.configure(
-            scrollregion=(0, 0, max(cw, new_w), max(ch, new_h)),
-        )
-
-        self._page_label.config(
-            text=f"page {self.pages.idx + 1} / {len(self.pages.pages)}"
-        )
-        self._title_sub.config(text=f"{src_w} × {src_h} px")
-        self._status.config(
-            text=f"{scale * 100:.1f} %  ·  {new_w}×{new_h} px"
-        )
-
-    # ------------------------------------------------------------------ #
-    # Actions                                                            #
+    # File / page actions                                                #
     # ------------------------------------------------------------------ #
 
     def _save_png(self) -> None:
-        path = filedialog.asksaveasfilename(
-            defaultextension=".png", filetypes=[("PNG", "*.png")])
+        path, _ = QFileDialog.getSaveFileName(
+            self.win, "Save PNG", "", "PNG image (*.png)")
         if path:
             self.pages.current().save_png(path)
 
     def _save_pdf(self) -> None:
-        path = filedialog.asksaveasfilename(
-            defaultextension=".pdf", filetypes=[("PDF", "*.pdf")])
+        path, _ = QFileDialog.getSaveFileName(
+            self.win, "Save PDF", "", "PDF document (*.pdf)")
         if path:
             self.pages.current().save_pdf(path)
 
     def _clear(self) -> None:
         self.pages.current().clear()
-        self._request_render()
-        self.streamer.wake()
+        self.canvas_view.invalidate()
+        if self.streamer is not None:
+            self.streamer.wake()
 
     def _new_page(self) -> None:
         self.pages.new_page()
         self._sync_from_canvas()
-        self._request_render()
-        self.streamer.reset()
+        self.canvas_view.invalidate()
+        if self.streamer is not None:
+            self.streamer.reset()
 
     def _next_page(self) -> None:
         self.pages.next_page()
         self._sync_from_canvas()
-        self._request_render()
-        self.streamer.reset()
+        self.canvas_view.invalidate()
+        if self.streamer is not None:
+            self.streamer.reset()
 
     def _prev_page(self) -> None:
         self.pages.prev_page()
         self._sync_from_canvas()
-        self._request_render()
-        self.streamer.reset()
+        self.canvas_view.invalidate()
+        if self.streamer is not None:
+            self.streamer.reset()
 
-    def _on_close(self) -> None:
-        self._closed = True
-        try:
-            self.root.destroy()
-        except tk.TclError:
-            pass
+    # ------------------------------------------------------------------ #
+    # Status footer                                                      #
+    # ------------------------------------------------------------------ #
+
+    def _update_status(self) -> None:
+        canvas = self.pages.current()
+        scale = self.canvas_view._effective_scale
+        tw = max(1, int(canvas.width * scale))
+        th = max(1, int(canvas.height * scale))
+        self._page_label.setText(
+            f"page {self.pages.idx + 1} / {len(self.pages.pages)}")
+        self._subtitle.setText(f"{canvas.width} × {canvas.height} px")
+        self._status.setText(f"{scale * 100:.1f} %  ·  {tw}×{th} px")

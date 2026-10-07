@@ -934,7 +934,7 @@ def main(argv=None) -> int:
     if args.gui and stream_enabled:
         try:
             from .gui import DrawingWindow
-            gui = DrawingWindow(pages, streamer)
+            gui = DrawingWindow(pages, streamer, injector=injector)
         except Exception as exc:
             log.warning("GUI unavailable: %s", exc)
             gui = None

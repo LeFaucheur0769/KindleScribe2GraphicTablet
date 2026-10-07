@@ -47,7 +47,7 @@ class PenConfig:
 
 @dataclass
 class StreamConfig:
-    active_wf: str = "DU"
+    active_wf: str = "GC16"
     clean_wf: str = "GL16"
     flash_wf: str = "GC16"
     settle: float = 1.5
