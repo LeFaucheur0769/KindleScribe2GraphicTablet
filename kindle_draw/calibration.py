@@ -1,24 +1,26 @@
+"""Map raw stylus coordinates to canvas / target coordinates.
 
-"""Map raw stylus coordinates to canvas coordinates.
+Calibration is always done with the Scribe held in its **native portrait
+orientation**. The resulting affine transform maps raw digitizer samples
+to portrait panel coordinates (1860 × 2480 on a Scribe).
 
-Three-point calibration. The transform is a general 2D affine, which
-handles any rotation / axis swap between the digitizer's native frame
-and the user's perceived frame — so calibration works whether the
-Scribe is held in portrait or landscape.
+Rotation to match the host's screen shape is applied **at runtime**, not
+stored in the calibration file. See :func:`apply_rotation` and
+:func:`raw_to_target`.
 """
 
 from __future__ import annotations
 
 import io
 import json
-import logging
+import logging  
 import os
 import time
-from typing import Optional, Tuple
+from typing import Tuple
 
 from PIL import Image, ImageDraw
 
-from .evdev_reader import StylusTracker, unpack_event
+from .evdev_reader import StylusTracker, unpack_event 
 
 log = logging.getLogger(__name__)
 
@@ -87,63 +89,64 @@ def _wait_for_tap(kindle, dev: str, esz: int, timeout: float = 120.0
 
 
 # --------------------------------------------------------------------------- #
-# Rotation helpers                                                           #
+# Rotation (runtime only, never stored in the calibration file)              #
 # --------------------------------------------------------------------------- #
 
-def user_to_native(tx, ty, panel_w, panel_h, rotation):
-    """Map a position in the user's perceived frame to native panel coords."""
-    if rotation == 0:
-        return tx, ty
-    if rotation == 90:
-        return panel_w - ty, tx
-    if rotation == 180:
-        return panel_w - tx, panel_h - ty
-    if rotation == 270:
-        return ty, panel_h - tx
-    raise ValueError(f"bad rotation: {rotation}")
-
-
-def native_to_user(nx, ny, panel_w, panel_h, rotation):
-    """Inverse of user_to_native."""
-    if rotation == 0:
-        return nx, ny
-    if rotation == 90:
-        return ny, panel_w - nx
-    if rotation == 180:
-        return panel_w - nx, panel_h - ny
-    if rotation == 270:
-        return panel_h - ny, nx
-    raise ValueError(f"bad rotation: {rotation}")
-
-
-# --------------------------------------------------------------------------- #
-# Calibration driver                                                         #
-# --------------------------------------------------------------------------- #
-
-def calibrate(kindle, panel_w: int, panel_h: int, dev: str, esz: int,
-              rotation: int = 0) -> list:
-    """Prompt the user to tap three targets and return the sample list.
-
-    The user perceives a frame of size ``(user_w, user_h)`` — the native
-    panel dimensions, possibly swapped for 90°/270° rotation. We draw
-    each crosshair at its native position so FBInk places it correctly
-    on the panel, and record the sample's canvas coordinate in the
-    *user's* frame. A general affine transform then solves the mapping.
-    """
+def rotated_size(panel_w: int, panel_h: int, rotation: int) -> Tuple[int, int]:
+    """Size of the perceived frame after rotating the panel from portrait."""
     if rotation in (90, 270):
-        user_w, user_h = panel_h, panel_w
-    else:
-        user_w, user_h = panel_w, panel_h
+        return panel_h, panel_w
+    return panel_w, panel_h
 
+
+def apply_rotation(px: float, py: float, panel_w: int, panel_h: int,
+                   rotation: int) -> Tuple[float, float]:
+    """Rotate a portrait panel coordinate into the user's perceived frame.
+
+    ``rotation`` describes how the user has physically rotated the Scribe
+    from its native portrait orientation:
+
+        0    portrait (native, no rotation)
+        90   rotated 90° clockwise  (native top edge is now on the right)
+        180  upside-down
+        270  rotated 90° counter-clockwise (native top edge is now on the left)
+
+    Output coordinates are in a frame of size ``rotated_size(...)``.
+    """
+    if rotation == 0:
+        return px, py
+    if rotation == 90:
+        # Portrait TL → rotated TR. Rotated x runs from portrait bottom to
+        # top; rotated y runs from portrait left to right.
+        return panel_h - py, px
+    if rotation == 180:
+        return panel_w - px, panel_h - py
+    if rotation == 270:
+        # Portrait TL → rotated BL. Rotated x runs from portrait top to
+        # bottom; rotated y runs from portrait right to left.
+        return py, panel_w - px
+    raise ValueError(f"bad rotation: {rotation}")
+
+
+# --------------------------------------------------------------------------- #
+# Calibration driver — always portrait                                       #
+# --------------------------------------------------------------------------- #
+
+def calibrate(kindle, panel_w: int, panel_h: int, dev: str, esz: int) -> list:
+    """Three-corner calibration in native portrait orientation.
+
+    Draws crosshairs at the portrait corners of the panel, records three
+    raw stylus samples, and returns them. The resulting transform maps
+    raw → portrait panel coordinates. Rotation is a runtime concern.
+    """
     targets = [
         (120, 120, "TL"),
-        (user_w - 120, 120, "TR"),
-        (120, user_h - 120, "BL"),
+        (panel_w - 120, 120, "TR"),
+        (120, panel_h - 120, "BL"),
     ]
     samples = []
     for tx, ty, name in targets:
-        nx, ny = user_to_native(tx, ty, panel_w, panel_h, rotation)
-        img = _make_target_image(panel_w, panel_h, nx, ny, name)
+        img = _make_target_image(panel_w, panel_h, tx, ty, name)
         buf = io.BytesIO()
         img.save(buf, "PNG", compress_level=1)
         kindle.draw_png(buf.getvalue(), x=0, y=0, wf="GC16", flash=True,
@@ -160,15 +163,10 @@ def calibrate(kindle, panel_w: int, panel_h: int, dev: str, esz: int,
 # --------------------------------------------------------------------------- #
 
 def build_transform(samples: list) -> dict:
-    """Solve a general 2D affine from raw stylus coords to canvas coords.
+    """Solve a general 2D affine from raw stylus coords to portrait panel coords.
 
-    The transform is:
-        canvas_x = a * raw_x + b * raw_y + c
-        canvas_y = d * raw_x + e * raw_y + f
-
-    A general affine (rather than a diagonal one) is required whenever
-    the panel is rotated: in landscape, canvas_x is driven by raw_y and
-    canvas_y by raw_x, which the diagonal form cannot express.
+        panel_x = a * raw_x + b * raw_y + c
+        panel_y = d * raw_x + e * raw_y + f
     """
     if len(samples) < 3:
         raise ValueError("need at least 3 calibration samples")
@@ -239,7 +237,6 @@ def validate_calibration(cal: dict) -> None:
         if not all(k in t for k in ("a", "b", "c", "d", "e", "f")):
             raise ValueError("affine transform is incomplete")
     else:
-        # Legacy diagonal format.
         if not all(k in t for k in ("ax", "bx", "ay", "by")):
             raise ValueError("diagonal transform is incomplete")
         if t["ax"] == 0 or t["ay"] == 0:
@@ -251,7 +248,7 @@ def transform_is_legacy(cal: dict) -> bool:
 
 
 def _transform_xy(cal: dict, rx: int, ry: int) -> Tuple[float, float]:
-    """Apply the transform, supporting old diagonal and new affine formats."""
+    """Apply the calibration transform. Returns portrait panel coordinates."""
     t = cal["transform"]
     if "a" in t:
         return (t["a"] * rx + t["b"] * ry + t["c"],
@@ -279,7 +276,7 @@ def raw_to_canvas(
     canvas_w: int,
     canvas_h: int,
 ) -> Tuple[float, float, float]:
-    """Convert a raw stylus sample to canvas coords and a [0..1] pressure."""
+    """Raw stylus → canvas coords. No rotation: canvas mode is portrait."""
     xu, yu = _transform_xy(cal, rx, ry)
 
     panel = cal.get("panel", {"width": canvas_w, "height": canvas_h})
@@ -301,20 +298,32 @@ def raw_to_target(
     pressure: int,
     target_w: int,
     target_h: int,
+    rotation: int = 0,
 ) -> Tuple[float, float, float]:
-    """Map raw stylus coords onto a target of arbitrary size, preserving the
-    panel's aspect ratio (letterboxing the drawing area inside the target).
+    """Raw stylus → target coords, applying rotation and letterboxing.
+
+    The pipeline:
+
+    1. Apply the calibration affine → portrait panel coordinates.
+    2. Rotate into the user's perceived frame (size ``rotated_size(...)``).
+    3. Normalise, then letterbox the rotated panel into ``target_w ×
+       target_h`` while preserving the panel's aspect ratio.
+
+    Pass ``rotation=0`` for portrait-into-portrait mapping.
     """
-    xu, yu = _transform_xy(cal, rx, ry)
+    px, py = _transform_xy(cal, rx, ry)
 
     panel = cal.get("panel", {"width": target_w, "height": target_h})
     pw = panel["width"] or target_w
     ph = panel["height"] or target_h
 
-    nx = max(0.0, min(1.0, xu / pw))
-    ny = max(0.0, min(1.0, yu / ph))
+    ux, uy = apply_rotation(px, py, pw, ph, rotation)
+    rot_w, rot_h = rotated_size(pw, ph, rotation)
 
-    aspect_panel = pw / ph
+    nx = max(0.0, min(1.0, ux / rot_w))
+    ny = max(0.0, min(1.0, uy / rot_h))
+
+    aspect_panel = rot_w / rot_h
     aspect_target = target_w / target_h
     if aspect_panel < aspect_target:
         draw_h = target_h

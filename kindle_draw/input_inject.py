@@ -65,16 +65,25 @@ class StrokeToCanvasInjector(InputInjector):
 # --------------------------------------------------------------------------- #
 
 class UinputInjector(InputInjector):
-    """Kernel-level virtual Wacom-class tablet via /dev/uinput.
+    """Virtual tablet where the tip moves the cursor and the barrel button
+    is the sole source of clicks.
 
-    Recognised by libinput on X11 and Wayland alike as a pen tablet:
-    the cursor follows the pen absolutely, taps click, pressure flows
-    through ABS_PRESSURE for Krita/GIMP/Inkscape.
+    Two button modes:
+
+    * Momentary (default): press = click down, release = click up.
+      Hold-and-drag works naturally.
+    * Sticky: press = click stays down until the next press, regardless
+      of tip state. Useful for long drags without cramping your thumb.
+
+    Toggle at runtime with SIGUSR1 (see app.py) or start in either mode
+    with the ``--sticky-click`` CLI flag.
     """
 
     VENDOR = 0x1234
     PRODUCT = 0x5678
     VERSION = 1
+
+    HOVER_DISTANCE = 100
 
     def __init__(
         self,
@@ -82,14 +91,11 @@ class UinputInjector(InputInjector):
         height: int,
         pressure_max: int = 4095,
         name: str = "Kindle Scribe Pen",
+        sticky_click: bool = False,
     ) -> None:
         from evdev import UInput, AbsInfo, ecodes as e
 
-        # 12 units/mm ≈ 230 ppi, matching the Scribe panel. libinput refuses
-        # to classify a device as a tablet if ABS_X or ABS_Y has no
-        # resolution, so this value must be nonzero.
         RES_PER_MM = 12
-
         cap = {
             e.EV_ABS: [
                 (e.ABS_X,        AbsInfo(0, 0, width,  0, 0, RES_PER_MM)),
@@ -103,29 +109,54 @@ class UinputInjector(InputInjector):
                 e.BTN_TOOL_PEN,
                 e.BTN_TOOL_RUBBER,
                 e.BTN_TOUCH,
-                e.BTN_STYLUS,
-                e.BTN_STYLUS2,
             ],
         }
-
         self.ui = UInput(
-            cap,
-            name=name,
-            vendor=self.VENDOR,
-            product=self.PRODUCT,
-            version=self.VERSION,
-            bustype=e.BUS_USB,
-            # This is the magic bit — says "tablet, not mouse".
+            cap, name=name, vendor=self.VENDOR, product=self.PRODUCT,
+            version=self.VERSION, bustype=e.BUS_USB,
             input_props=[e.INPUT_PROP_DIRECT],
         )
 
         self.w = width
         self.h = height
         self.pmax = max(1, pressure_max)
-        self._in_range = False
-        self._eraser = False
 
-    # -- internal -------------------------------------------------------- #
+        self._last_x = width / 2.0
+        self._last_y = height / 2.0
+
+        self._in_range = False
+        self._touching = False
+        self._tip_down = False
+        self._eraser = False
+        self._button = False
+        self._button2 = False
+
+        # Sticky mode: when True, the button toggles a held click rather
+        # than acting as a momentary press. Doesn't affect anything else.
+        self._sticky = bool(sticky_click)
+
+    # -- public mode toggle -------------------------------------------- #
+
+    @property
+    def sticky_click(self) -> bool:
+        return self._sticky
+
+    def set_sticky_click(self, on: bool) -> bool:
+        """Force the sticky-click state. Returns the new value."""
+        on = bool(on)
+        if on == self._sticky:
+            return self._sticky
+        self._sticky = on
+        # Leaving sticky with a click still held: release it.
+        if not on and self._touching:
+            self._end_click()
+        return self._sticky
+
+    def toggle_sticky_click(self) -> bool:
+        """Flip the sticky-click state. Returns the new value."""
+        return self.set_sticky_click(not self._sticky)
+
+    # -- internal ------------------------------------------------------- #
 
     def _abs(self, code, v) -> None:
         from evdev import ecodes as e
@@ -135,42 +166,98 @@ class UinputInjector(InputInjector):
         from evdev import ecodes as e
         self.ui.write(e.EV_KEY, code, int(v))
 
-    def _state(self, x, y, p, tilt_x=0.0, tilt_y=0.0) -> None:
+    def _write_pos(self, x, y) -> None:
         from evdev import ecodes as e
         self._abs(e.ABS_X, max(0, min(self.w - 1, int(x))))
         self._abs(e.ABS_Y, max(0, min(self.h - 1, int(y))))
-        self._abs(e.ABS_PRESSURE, max(0, min(self.pmax, int(p * self.pmax))))
-        self._abs(e.ABS_TILT_X, max(-9000, min(9000, int(tilt_x))))
-        self._abs(e.ABS_TILT_Y, max(-9000, min(9000, int(tilt_y))))
+
+    def _write_hover_extras(self) -> None:
+        from evdev import ecodes as e
+        self._abs(e.ABS_PRESSURE, 0)
+        self._abs(e.ABS_DISTANCE, self.HOVER_DISTANCE)
+
+    def _write_click_extras(self) -> None:
+        from evdev import ecodes as e
+        self._abs(e.ABS_PRESSURE, self.pmax)
         self._abs(e.ABS_DISTANCE, 0)
+
+    def _enter_range(self) -> None:
+        from evdev import ecodes as e
+        if not self._in_range:
+            self._key(e.BTN_TOOL_RUBBER if self._eraser
+                      else e.BTN_TOOL_PEN, 1)
+            self._in_range = True
+
+    def _leave_range(self) -> None:
+        from evdev import ecodes as e
+        if self._in_range:
+            self._key(e.BTN_TOOL_PEN if not self._eraser
+                      else e.BTN_TOOL_RUBBER, 0)
+            self._in_range = False
+
+    def _begin_click(self) -> None:
+        from evdev import ecodes as e
+        self._enter_range()
+        self._write_pos(self._last_x, self._last_y)
+        self._write_click_extras()
+        if not self._touching:
+            self._key(e.BTN_TOUCH, 1)
+            self._touching = True
+
+    def _end_click(self) -> None:
+        from evdev import ecodes as e
+        if self._touching:
+            self._key(e.BTN_TOUCH, 0)
+            self._touching = False
+        self._write_pos(self._last_x, self._last_y)
+        self._write_hover_extras()
+        if not self._tip_down:
+            self._leave_range()
+
+    def _emit_position(self, x, y) -> None:
+        self._last_x = float(x)
+        self._last_y = float(y)
+        self._enter_range()
+        self._write_pos(x, y)
+        if self._touching:
+            self._write_click_extras()
+        else:
+            self._write_hover_extras()
 
     # -- InputInjector API ---------------------------------------------- #
 
     def down(self, x, y, p) -> None:
-        from evdev import ecodes as e
-        if not self._in_range:
-            # Enter range with the correct tool.
-            self._key(e.BTN_TOOL_RUBBER if self._eraser
-                      else e.BTN_TOOL_PEN, 1)
-            self._in_range = True
-        self._key(e.BTN_TOUCH, 1)
-        self._state(x, y, p)
+        self._tip_down = True
+        self._emit_position(x, y)
         self.ui.syn()
 
     def move(self, x, y, p) -> None:
-        self._state(x, y, p)
+        self._emit_position(x, y)
         self.ui.syn()
+
+    def move_hover(self, x, y, p) -> None:
+        # Cursor follows the pen whenever the click is active OR whenever
+        # we're in sticky mode (so the user can aim before pressing again
+        # to release). Otherwise stay silent.
+        if self._touching or self._button or self._button2 or self._sticky:
+            self._emit_position(x, y)
+            self.ui.syn()
 
     def up(self, x, y, p) -> None:
-        from evdev import ecodes as e
-        self._state(x, y, p)
-        self._key(e.BTN_TOUCH, 0)
+        self._tip_down = False
+        self._last_x = float(x)
+        self._last_y = float(y)
+        self._enter_range()
+        self._write_pos(x, y)
+        if self._touching:
+            self._write_click_extras()
+        else:
+            self._write_hover_extras()
+            if not self._button and not self._button2 and not self._sticky:
+                self._leave_range()
         self.ui.syn()
-        # Keep BTN_TOOL_PEN set — the pen stays "in range" between strokes,
-        # so the app treats it as hovering, not as a lifted mouse.
 
     def set_eraser(self, on: bool) -> None:
-        """Called when the pen's eraser button flips state."""
         from evdev import ecodes as e
         on = bool(on)
         if on == self._eraser:
@@ -181,16 +268,60 @@ class UinputInjector(InputInjector):
         self._eraser = on
         self.ui.syn()
 
+    def set_stylus_button(self, pressed: bool) -> None:
+        from evdev import ecodes as e
+        pressed = bool(pressed)
+        if pressed == self._button:
+            return
+        self._button = pressed
+
+        if self._sticky:
+            # Sticky mode: only the press edge matters — it toggles the
+            # click. Releases are ignored.
+            if pressed:
+                if self._touching:
+                    self._end_click()
+                else:
+                    self._begin_click()
+                self.ui.syn()
+            return
+
+        # Momentary mode: press = down, release = up.
+        if pressed:
+            self._begin_click()
+        else:
+            self._end_click()
+        self.ui.syn()
+
+    def set_stylus_button2(self, pressed: bool) -> None:
+        from evdev import ecodes as e
+        pressed = bool(pressed)
+        if pressed == self._button2:
+            return
+        self._button2 = pressed
+        if not self._sticky:
+            if pressed:
+                self._begin_click()
+            else:
+                self._end_click()
+        self.ui.syn()
+
     def close(self) -> None:
+        from evdev import ecodes as e
         try:
-            from evdev import ecodes as e
+            if self._touching:
+                self._key(e.BTN_TOUCH, 0)
             if self._in_range:
                 self._key(e.BTN_TOOL_PEN if not self._eraser
                           else e.BTN_TOOL_RUBBER, 0)
-                self.ui.syn()
+            self.ui.syn()
+        except Exception:
+            pass
+        try:
             self.ui.close()
         except Exception:
             pass
+        
 # --------------------------------------------------------------------------- #
 # xdotool backend (X11 only)                                                 #
 # --------------------------------------------------------------------------- #

@@ -22,7 +22,7 @@ class KindleConfig:
 class PanelConfig:
     width: int = 1860
     height: int = 2480
-    aspect: str = "fit"          # fit | crop | stretch
+    aspect: str = "fit"
     invert: bool = False
 
 
@@ -33,15 +33,14 @@ class StylusConfig:
     cal_path: str = "~/.kindle_draw_cal.json"
     pressure_min: Optional[int] = None
     pressure_max: Optional[int] = None
-    rotate: int = 0   # 0, 90, 180, 270 — clockwise, "hold the Scribe with
-                      # its native top edge toward the given side"
+    # NOTE: no `rotate` here. Calibration is always portrait; rotation is
+    # resolved at runtime and lives on InjectConfig.
 
 
 @dataclass
 class PenConfig:
-    """Pen and eraser defaults. All overridable on the CLI and live from the GUI."""
     color: Tuple[int, int, int] = (0, 0, 0)
-    size: float = 8.0                 # max stroke width in pixels
+    size: float = 8.0
     eraser_size: float = 48.0
     pressure_sensitive: bool = True
 
@@ -61,8 +60,9 @@ class StreamConfig:
 @dataclass
 class InjectConfig:
     mode: str = "canvas"
-    width: int = 0     # 0 = resolved at startup by build_config
+    width: int = 0          # 0 = resolved at startup by build_config
     height: int = 0
+    rotation: int = 0       # 0/90/180/270; only meaningful for system injectors
 
 
 @dataclass
