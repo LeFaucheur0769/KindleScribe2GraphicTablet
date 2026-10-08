@@ -470,6 +470,13 @@ class Launcher(QMainWindow):
         self._sticky = QCheckBox("Sticky click (barrel button toggles)")
         form.addRow("", self._sticky)
 
+        self._no_letterbox = QCheckBox("Stretch pen to fill screen")
+        self._no_letterbox.setToolTip(
+            "When on, the Scribe's corners map to the screen's corners "
+            "(shape distorted). When off, aspect ratio is preserved and "
+            "the pen only reaches the central rectangle of the screen.")
+        form.addRow("", self._no_letterbox)
+
         return box
 
     def _build_view_box(self) -> QGroupBox:
@@ -635,6 +642,7 @@ class Launcher(QMainWindow):
             "flash_wf": self._flash_wf.currentText(),
             "fps": self._fps.value(),
             "threshold": self._threshold.value(),
+            "no_letterbox": self._no_letterbox.isChecked(),
             "verbose": self._verbose.isChecked(),
         }
         if self._remember_password.isChecked() and self._password.text():
@@ -677,6 +685,7 @@ class Launcher(QMainWindow):
         b("pressure_sensitive", self._pressure, True)
 
         b("open_gui", self._open_gui, True)
+        b("no_letterbox", self._no_letterbox)
 
         idx = self._cursor.findText(cfg.get("cursor", "off"))
         if idx >= 0:
@@ -769,6 +778,8 @@ class Launcher(QMainWindow):
             args += ["--rotate", cfg["rotate"]]
             if cfg["sticky_click"]:
                 args += ["--sticky-click"]
+            if cfg.get("no_letterbox"):
+                args += ["--no-letterbox"]
         if cfg["pen_color"]:
             args += ["--pen-color", cfg["pen_color"]]
         args += ["--pen-size", str(cfg["pen_size"])]
