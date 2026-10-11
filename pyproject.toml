@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kindle-draw"
+version = "0.1.0"
+description = "Use a jailbroken Kindle Scribe as a graphics tablet for your PC."
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.9"
+dependencies = [
+    "Pillow>=9.0",
+]
+
+[project.optional-dependencies]
+# Only needed for `--inject uinput` on Linux.
+uinput = ["evdev>=1.5; sys_platform == 'linux'"]
+dev = ["pytest>=7.0"]
+
+[project.scripts]
+kindle-draw = "kindle_draw.app:main"
+
+[tool.setuptools]
+packages = ["kindle_draw"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Lets `pytest` work straight from the repo root without installing the
+# package first (the tests only exercise pure logic, no entry points).
+pythonpath = ["."]

@@ -1,3 +1,7 @@
+# Runtime dependencies. Canonical metadata lives in pyproject.toml
+# (`pip install .` or `pip install .[uinput]`); this file is kept for
+# `pip install -r requirements.txt` workflows.
 Pillow>=9.0
 # Optional, only needed for `--inject uinput` on Linux:
 evdev>=1.5 ; sys_platform == "linux"
+
