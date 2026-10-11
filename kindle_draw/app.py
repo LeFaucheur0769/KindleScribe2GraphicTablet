@@ -219,7 +219,7 @@ def detect_screen_size() -> Optional[Tuple[int, int]]:
             out = subprocess.run(["kscreen-doctor", "-o"],
                                  capture_output=True, text=True,
                                  timeout=2).stdout
-            m = re.search(r"Geometry:\s*\d+,\d+\s+(\d+)x(\d+)", out)
+            m = re.search(r"Geometry:\s*(?:\d+,\d+\s+)?(\d+)x(\d+)", out)
             if m:
                 return int(m.group(1)), int(m.group(2))
         except Exception:
@@ -426,8 +426,8 @@ class StylusReader(threading.Thread):
 
     def _stretch(self, rx, ry, pressure, tw, th):
         """--no-letterbox: rotate + stretch to fill, preserving axis swap."""
-        from .calibration import apply_rotation, _transform_xy, _pressure
-        px, py = _transform_xy(self.cal, rx, ry)
+        from .calibration import apply_rotation, transform_xy, normalize_pressure
+        px, py = transform_xy(self.cal, rx, ry)
         panel = self.cal.get("panel", {"width": tw, "height": th})
         pw = panel["width"] or tw
         ph = panel["height"] or th
@@ -440,7 +440,7 @@ class StylusReader(threading.Thread):
         y = (uy / rot_h) * th
         pmin = self.cal["pressure"]["min"]
         pmax = self.cal["pressure"]["max"]
-        return x, y, _pressure(pmin, pmax, pressure)
+        return x, y, normalize_pressure(pmin, pmax, pressure)
 
     def stop(self) -> None:
         self.stop_event.set()

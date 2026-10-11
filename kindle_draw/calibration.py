@@ -149,8 +149,7 @@ def calibrate(kindle, panel_w: int, panel_h: int, dev: str, esz: int) -> list:
         img = _make_target_image(panel_w, panel_h, tx, ty, name)
         buf = io.BytesIO()
         img.save(buf, "PNG", compress_level=1)
-        kindle.draw_png(buf.getvalue(), x=0, y=0, wf="GC16", flash=True,
-                        no_clear=False)
+        kindle.draw_png(buf.getvalue(), x=0, y=0, wf="GC16", flash=True)
         log.info("calibration: tap the %s target", name)
         rx, ry, pr = _wait_for_tap(kindle, dev, esz)
         log.info("  %s -> raw=(%d, %d) pressure=%d", name, rx, ry, pr)
@@ -247,7 +246,7 @@ def transform_is_legacy(cal: dict) -> bool:
     return "a" not in cal.get("transform", {})
 
 
-def _transform_xy(cal: dict, rx: int, ry: int) -> Tuple[float, float]:
+def transform_xy(cal: dict, rx: int, ry: int) -> Tuple[float, float]:
     """Apply the calibration transform. Returns portrait panel coordinates."""
     t = cal["transform"]
     if "a" in t:
@@ -261,7 +260,7 @@ def _transform_xy(cal: dict, rx: int, ry: int) -> Tuple[float, float]:
 # Runtime mapping                                                            #
 # --------------------------------------------------------------------------- #
 
-def _pressure(pmin: int, pmax: int, pressure: int) -> float:
+def normalize_pressure(pmin: int, pmax: int, pressure: int) -> float:
     if pmax <= pmin:
         return 1.0
     p = (pressure - pmin) / (pmax - pmin)
@@ -277,7 +276,7 @@ def raw_to_canvas(
     canvas_h: int,
 ) -> Tuple[float, float, float]:
     """Raw stylus → canvas coords. No rotation: canvas mode is portrait."""
-    xu, yu = _transform_xy(cal, rx, ry)
+    xu, yu = transform_xy(cal, rx, ry)
 
     panel = cal.get("panel", {"width": canvas_w, "height": canvas_h})
     pw = panel["width"] or canvas_w
@@ -288,7 +287,7 @@ def raw_to_canvas(
 
     pmin = cal["pressure"]["min"]
     pmax = cal["pressure"]["max"]
-    return x, y, _pressure(pmin, pmax, pressure)
+    return x, y, normalize_pressure(pmin, pmax, pressure)
 
 
 def raw_to_target(
@@ -311,7 +310,7 @@ def raw_to_target(
 
     Pass ``rotation=0`` for portrait-into-portrait mapping.
     """
-    px, py = _transform_xy(cal, rx, ry)
+    px, py = transform_xy(cal, rx, ry)
 
     panel = cal.get("panel", {"width": target_w, "height": target_h})
     pw = panel["width"] or target_w
@@ -339,4 +338,4 @@ def raw_to_target(
 
     pmin = cal["pressure"]["min"]
     pmax = cal["pressure"]["max"]
-    return x, y, _pressure(pmin, pmax, pressure)
+    return x, y, normalize_pressure(pmin, pmax, pressure)
