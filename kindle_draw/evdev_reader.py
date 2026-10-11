@@ -108,9 +108,12 @@ def parse_input_devices(text: str) -> List[dict]:
                 if m:
                     d["event"] = "/dev/input/" + m.group(0)
             elif key == "B":
-                parts = val.split(None, 1)
-                if len(parts) == 2:
-                    name, tokens = parts
+                # Lines look like "B: KEY=c01 0 0 ... ABS=f000003".  Split on
+                # the '=' so the bitmap name is the text before it, not the
+                # first whitespace-separated token (which was the whole
+                # "KEY=c01" string, making bm.get("KEY") always miss).
+                name, sep, tokens = val.partition("=")
+                if sep:
                     d["bitmaps"][name] = parse_multitoken_bitmap(tokens.split())
             elif key == "I":
                 for k, v in re.findall(r"(\w+)=(\w+)", val):
