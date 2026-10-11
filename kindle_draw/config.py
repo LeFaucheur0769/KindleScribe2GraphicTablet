@@ -15,7 +15,7 @@ class KindleConfig:
     password: Optional[str] = None
     fbink: str = "/mnt/us/libkh/bin/fbink"
     control_path: Optional[str] = None
-    tmp_png: str = "/tmp/_kindle_draw.png"
+    tmp_png: Optional[str] = None   # None -> unique per-instance remote path
 
 
 @dataclass

@@ -271,8 +271,7 @@ class Streamer(threading.Thread):
             buf = io.BytesIO()
             img.save(buf, "PNG", compress_level=1)
             self.kindle.draw_png(buf.getvalue(), x=0, y=0,
-                                 wf=self.cfg.flash_wf, flash=True,
-                                 no_clear=False)
+                                 wf=self.cfg.flash_wf, flash=True)
             self._last = self._blank
             self._cursor_drawn = cur
             self._dirty_union = (0, 0, self._panel_w, self._panel_h)
@@ -294,7 +293,7 @@ class Streamer(threading.Thread):
                     buf = io.BytesIO()
                     crop.save(buf, "PNG", compress_level=1)
                     self.kindle.draw_png(buf.getvalue(), x=box[0], y=box[1],
-                                         wf=self.cfg.clean_wf, no_clear=True)
+                                         wf=self.cfg.clean_wf)
                 self._clean_pending = False
             return
 
@@ -320,7 +319,7 @@ class Streamer(threading.Thread):
         buf = io.BytesIO()
         crop.save(buf, "PNG", compress_level=1)
         self.kindle.draw_png(buf.getvalue(), x=dirty[0], y=dirty[1],
-                             wf=self.cfg.active_wf, no_clear=True)
+                             wf=self.cfg.active_wf)
         self._last = self._blank
         self._cursor_drawn = cur
         self._dirty_union = union(self._dirty_union, dirty)
@@ -372,13 +371,15 @@ class Streamer(threading.Thread):
 
         dirty = None
 
-        if v != self._last_version or True:
-            diff = ImageChops.difference(preview, self._last)
-            bbox = _diff_bbox(diff, self.cfg.threshold)
-            if bbox is not None:
-                bbox = snap_box(bbox, self.cfg.align,
-                                self._panel_w, self._panel_h)
-                dirty = union(dirty, bbox)
+        # The early-return above already handles the fully-unchanged case,
+        # so whenever we get here something (canvas or cursor) has moved and
+        # the diff must be computed.
+        diff = ImageChops.difference(preview, self._last)
+        bbox = _diff_bbox(diff, self.cfg.threshold)
+        if bbox is not None:
+            bbox = snap_box(bbox, self.cfg.align,
+                            self._panel_w, self._panel_h)
+            dirty = union(dirty, bbox)
 
         if cursor_changed:
             if self._cursor_drawn is not None:
@@ -418,7 +419,7 @@ class Streamer(threading.Thread):
         log.debug("streamer: full refresh %dx%d", img.size[0], img.size[1])
         self.kindle.draw_png(
             buf.getvalue(), x=0, y=0,
-            wf=self.cfg.flash_wf, flash=True, no_clear=False,
+            wf=self.cfg.flash_wf, flash=True,
         )
 
     def _send_region(self, preview: Image.Image, bbox: Box, wf: str) -> None:
@@ -428,7 +429,7 @@ class Streamer(threading.Thread):
         x0, y0, _x1, _y1 = bbox
         log.debug("streamer: partial refresh %s wf=%s", bbox, wf)
         self.kindle.draw_png(
-            buf.getvalue(), x=x0, y=y0, wf=wf, no_clear=True,
+            buf.getvalue(), x=x0, y=y0, wf=wf,
         )
 
     def _send_clean_canvas(self, preview: Image.Image, cursor) -> None:

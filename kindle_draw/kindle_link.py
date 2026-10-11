@@ -36,6 +36,14 @@ class KindleLink:
         self._closed = False
         self._master_up = False
 
+        # Remote scratch file for FBInk. When not configured, pick a unique
+        # path per link instance so concurrent processes (e.g. a streamer
+        # and a calibration run) cannot overwrite each other's image.
+        if cfg.tmp_png:
+            self.tmp_png = cfg.tmp_png
+        else:
+            self.tmp_png = f"/tmp/_kindle_draw-{os.getpid()}-{id(self):x}.png"
+
     # ------------------------------------------------------------------ #
     # Master connection                                                   #
     # ------------------------------------------------------------------ #
@@ -201,7 +209,6 @@ class KindleLink:
         y: int = 0,
         wf: Optional[str] = None,
         flash: bool = False,
-        no_clear: bool = True,   # kept for API compat; not used
     ) -> None:
         # NOTE: waveform flag is UPPERCASE -W (--waveform MODE).
         # Lowercase -w is --wait; using it makes FBInk print the waveform
@@ -211,10 +218,10 @@ class KindleLink:
             parts.append("-f")
         if wf:
             parts += ["-W", wf]
-        parts += ["-g", f"file={self.cfg.tmp_png},x={x},y={y}"]
+        parts += ["-g", f"file={self.tmp_png},x={x},y={y}"]
 
         cmd = (
-            f"cat > {shlex.quote(self.cfg.tmp_png)} && "
+            f"cat > {shlex.quote(self.tmp_png)} && "
             + " ".join(shlex.quote(a) for a in parts)
         )
         log.debug("fbink: %s", " ".join(parts))
