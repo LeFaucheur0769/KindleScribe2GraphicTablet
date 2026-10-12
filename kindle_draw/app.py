@@ -849,7 +849,13 @@ def build_config(args: argparse.Namespace) -> AppConfig:
 def main(argv=None) -> int:
     args = parse_args(argv)
     setup_logging(args.verbose)
-    cfg = build_config(args)
+    try:
+        cfg = build_config(args)
+    except ValueError as exc:
+        # Bad flag combinations (e.g. --touch-range with 2 or 3 values) get a
+        # one-line error instead of a traceback.
+        log.error("%s", exc)
+        return 2
 
     kindle = KindleLink(cfg.kindle)
     log.info("connecting to %s@%s:%d",

@@ -23,7 +23,7 @@ from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog,
     QFormLayout, QFrame, QGridLayout, QGroupBox, QHBoxLayout, QLabel,
     QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit, QPushButton,
-    QSpinBox, QSplitter, QVBoxLayout, QWidget,
+    QScrollArea, QSpinBox, QSplitter, QVBoxLayout, QWidget,
 )
 
 from .gui import (
@@ -197,6 +197,17 @@ QSplitter::handle {{
     height: 2px;
 }}
 
+/* The config scroll area must blend into the window background; Qt would
+   otherwise paint its viewport with the palette's base colour. */
+QScrollArea {{
+    background: transparent;
+    border: none;
+}}
+
+QScrollArea > QWidget > QWidget {{
+    background: transparent;
+}}
+
 QScrollBar:vertical, QScrollBar:horizontal {{
     background: {BG_WINDOW};
     width: 10px;
@@ -243,8 +254,14 @@ class Launcher(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("Kindle Draw — Launcher")
-        self.setMinimumSize(980, 720)
-        self.resize(1040, 800)
+        # The config area is scrollable, so the window can shrink well below
+        # the natural size of its widgets.  Clamp the initial size to the
+        # available screen geometry so the window (and the log pane) fits on
+        # small or low-resolution displays.
+        self.setMinimumSize(620, 480)
+        screen = QApplication.primaryScreen().availableGeometry()
+        self.resize(min(1040, int(screen.width() * 0.92)),
+                    min(800, int(screen.height() * 0.92)))
 
         self._proc: Optional[subprocess.Popen] = None
         self._log_queue: "queue.Queue[str]" = queue.Queue()
@@ -293,10 +310,24 @@ class Launcher(QMainWindow):
         splitter = QSplitter(Qt.Vertical)
         outer.addWidget(splitter, 1)
 
+        # The config boxes live inside a scroll area: on short screens the
+        # settings shrink to a scrollable pane instead of forcing the window
+        # taller than the desktop and squeezing the log out of view.
         config_area = QWidget()
-        splitter.addWidget(config_area)
+        config_scroll = QScrollArea()
+        config_scroll.setWidget(config_area)
+        config_scroll.setWidgetResizable(True)
+        config_scroll.setFrameShape(QFrame.NoFrame)
+        splitter.addWidget(config_scroll)
+
         log_area = QWidget()
         splitter.addWidget(log_area)
+
+        # Give both panes a fair share when the window is resized, and keep
+        # the log from being collapsed to nothing by the drag handle.
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 2)
+        splitter.setChildrenCollapsible(False)
         splitter.setSizes([420, 280])
 
         # --- config grid ---------------------------------------------- #
@@ -310,6 +341,9 @@ class Launcher(QMainWindow):
         grid.addWidget(self._build_view_box(),     1, 1)
         grid.addWidget(self._build_output_box(),   2, 0)
         grid.addWidget(self._build_advanced_box(), 2, 1)
+        # Pinch zoom spans both columns: it only applies to canvas mode and
+        # groups naturally under the mode/output boxes.
+        grid.addWidget(self._build_touch_box(),    3, 0, 1, 2)
 
         # --- log ------------------------------------------------------- #
         log_layout = QVBoxLayout(log_area)
@@ -327,6 +361,9 @@ class Launcher(QMainWindow):
         self._log = QPlainTextEdit()
         self._log.setReadOnly(True)
         self._log.setMaximumBlockCount(4000)
+        # Hard floor so the log always keeps a readable slice, even when
+        # the window is dragged to its minimum size.
+        self._log.setMinimumHeight(140)
         log_layout.addWidget(self._log, 1)
 
         # --- action bar ------------------------------------------------- #
@@ -556,6 +593,66 @@ class Launcher(QMainWindow):
 
         return box
 
+    def _build_touch_box(self) -> QGroupBox:
+        """Pinch-zoom / pan controls, mirroring the CLI's Touch group.
+
+        Maps to ``--pinch``, ``--touch-pan``, ``--max-zoom``,
+        ``--touch-dev`` and ``--touch-range``.  The box is only enabled in
+        canvas mode because the gesture manipulates the host-side canvas
+        viewport (the CLI warns and ignores ``--pinch`` in other modes).
+        """
+        box = QGroupBox("Pinch zoom (canvas mode)")
+        box.setToolTip(
+            "Read the Kindle's touchscreen over a second SSH stream and\n"
+            "scale/pan the drawing canvas with two fingers.\n"
+            "Reset the view to 1:1 with:  kill -USR2 <pid>")
+        form = QFormLayout(box)
+        form.setLabelAlignment(Qt.AlignRight)
+        form.setContentsMargins(12, 8, 12, 8)
+        form.setSpacing(6)
+
+        self._pinch = QCheckBox("Enable pinch zoom (2-finger scale)")
+        self._pinch.setToolTip(
+            "Two fingers on the Kindle screen scale the canvas viewport; a\n"
+            "two-finger drag pans it. The stylus draws what is visible\n"
+            "under its tip (brush widths stay in canvas units, so strokes\n"
+            "look thicker on screen while zoomed in).")
+        self._pinch.toggled.connect(self._on_pinch_toggled)
+        form.addRow("", self._pinch)
+
+        self._touch_pan = QCheckBox("Single-finger pan too")
+        self._touch_pan.setToolTip(
+            "Also pan with one finger. Off by default so stylus-induced\n"
+            "single touches do not move the view.")
+        form.addRow("", self._touch_pan)
+
+        self._max_zoom = QDoubleSpinBox()
+        self._max_zoom.setRange(1.5, 20.0)
+        self._max_zoom.setSingleStep(0.5)
+        self._max_zoom.setValue(8.0)
+        self._max_zoom.setSuffix("x")
+        self._max_zoom.setToolTip("Maximum zoom factor (--max-zoom).")
+        form.addRow("Max zoom", self._max_zoom)
+
+        self._touch_dev = QLineEdit()
+        self._touch_dev.setPlaceholderText("auto — e.g. /dev/input/event2")
+        self._touch_dev.setToolTip(
+            "Touchscreen event device. Leave empty to auto-detect the\n"
+            "device that reports ABS_MT_* multitouch events.")
+        form.addRow("Touch device", self._touch_dev)
+
+        self._touch_range = QLineEdit()
+        self._touch_range.setPlaceholderText("auto, or XMIN XMAX YMIN YMAX")
+        self._touch_range.setToolTip(
+            "Raw touchscreen coordinate range used to map finger deltas to\n"
+            "canvas units. Leave empty to infer it from observed events;\n"
+            "set the four numbers if autodetection feels off.")
+        form.addRow("Touch range", self._touch_range)
+
+        # Sub-options only matter while pinch is enabled.
+        self._on_pinch_toggled(False)
+        return box
+
     def _path_row(self, form: QFormLayout, label: str,
                   mode: str = "save", filt: str = "") -> QLineEdit:
         row = QWidget()
@@ -611,6 +708,19 @@ class Launcher(QMainWindow):
         self._rotate.setEnabled(system)
         self._sticky.setEnabled(system)
 
+        # Pinch zoom only manipulates the canvas-mode viewport; the CLI
+        # warns and ignores --pinch in the other modes, so the whole box
+        # follows the inject selector (the checked state is preserved in
+        # case the user switches back to canvas).
+        self._pinch.setEnabled(mode == "canvas")
+        self._on_pinch_toggled(mode == "canvas" and self._pinch.isChecked())
+
+    def _on_pinch_toggled(self, on: bool) -> None:
+        """Gate the pinch sub-options behind the main --pinch checkbox."""
+        for widget in (self._touch_pan, self._max_zoom,
+                       self._touch_dev, self._touch_range):
+            widget.setEnabled(on)
+
     # ------------------------------------------------------------------ #
     # Config I/O                                                         #
     # ------------------------------------------------------------------ #
@@ -644,6 +754,11 @@ class Launcher(QMainWindow):
             "threshold": self._threshold.value(),
             "no_letterbox": self._no_letterbox.isChecked(),
             "verbose": self._verbose.isChecked(),
+            "pinch": self._pinch.isChecked(),
+            "touch_pan": self._touch_pan.isChecked(),
+            "max_zoom": self._max_zoom.value(),
+            "touch_dev": self._touch_dev.text().strip(),
+            "touch_range": self._touch_range.text().strip(),
         }
         if self._remember_password.isChecked() and self._password.text():
             cfg["password"] = self._password.text()
@@ -713,6 +828,14 @@ class Launcher(QMainWindow):
         self._fps.setValue(float(cfg.get("fps", 15.0)))
         self._threshold.setValue(int(cfg.get("threshold", 8)))
         b("verbose", self._verbose)
+
+        # Touch controls (absent from configs saved before pinch zoom
+        # existed) fall back to the CLI defaults.
+        b("pinch", self._pinch)
+        b("touch_pan", self._touch_pan)
+        self._max_zoom.setValue(float(cfg.get("max_zoom", 8.0)))
+        self._touch_dev.setText(str(cfg.get("touch_dev", "") or ""))
+        self._touch_range.setText(str(cfg.get("touch_range", "") or ""))
 
         self._on_inject_changed(self._inject.currentText())
 
@@ -808,6 +931,36 @@ class Launcher(QMainWindow):
             args += ["--pages-dir", cfg["pages_dir"]]
         if cfg["open_gui"] and cfg["inject"] == "canvas":
             args += ["--gui"]
+
+        # Pinch zoom is a canvas-mode feature (the CLI warns and ignores
+        # --pinch in the other injection modes), so only emit it there.
+        if cfg["pinch"] and cfg["inject"] == "canvas":
+            args += ["--pinch"]
+            if cfg["touch_pan"]:
+                args += ["--touch-pan"]
+            args += ["--max-zoom", str(cfg["max_zoom"])]
+            if cfg["touch_dev"]:
+                args += ["--touch-dev", cfg["touch_dev"]]
+            # The range field is free text: empty or "auto" means let the
+            # tool autodetect; otherwise it must be 1 int (max for both
+            # axes) or 4 ints (XMIN XMAX YMIN YMAX), matching the CLI's
+            # --touch-range argument.
+            raw_range = str(cfg["touch_range"]).strip()
+            if raw_range and raw_range.lower() != "auto":
+                parts = raw_range.replace(",", " ").split()
+                try:
+                    nums = [int(p) for p in parts]
+                except ValueError:
+                    nums = []
+                if len(nums) not in (1, 4):
+                    QMessageBox.warning(
+                        self, "Invalid touch range",
+                        "Touch range must be empty (auto-detect), one "
+                        "number (axis maximum), or four numbers: "
+                        "XMIN XMAX YMIN YMAX.")
+                    return None
+                args += ["--touch-range"] + [str(n) for n in nums]
+
         if cfg["verbose"]:
             args += ["-v"]
 
