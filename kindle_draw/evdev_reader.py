@@ -35,6 +35,13 @@ ABS_TILT_Y   = 0x1b
 
 MT_CODES = set(range(0x2f, 0x40))
 
+# Named members of MT_CODES (kernel input-event-codes.h values) used by the
+# touchscreen device heuristic.
+ABS_MT_SLOT        = 0x2f  # 47
+ABS_MT_TRACKING_ID = 0x35  # 53
+ABS_MT_POSITION_X  = 0x36  # 54
+ABS_MT_POSITION_Y  = 0x37  # 55
+
 _EVENT_64 = struct.Struct("<qqHHi")
 _EVENT_32 = struct.Struct("<IIHHi")
 
@@ -170,6 +177,75 @@ def find_stylus_device(devices: List[dict]) -> Optional[dict]:
 
     if best is not None:
         log.debug("chosen stylus device: %s (score=%d)", best.get("event"), best_score)
+    return best
+
+
+def find_touch_device(devices: List[dict]) -> Optional[dict]:
+    """Pick the finger-touchscreen device (mirror image of find_stylus_device).
+
+    Scoring is the inverse of the stylus heuristic: multi-touch ABS bits and
+    finger-ish device names are rewarded, pen/Wacom hints are penalised so the
+    EMR stylus device is never mistaken for the touchscreen.  A candidate is
+    only returned when it clears the score threshold *and* exposes at least one
+    ABS_MT_* axis, which keeps this from silently returning the stylus device
+    (or a keyboard) when no usable touchscreen exists.
+    """
+    best: Optional[dict] = None
+    best_score = -999
+    for d in devices:
+        if "event" not in d:
+            continue
+        name = (d.get("name") or "").lower()
+        bm = d.get("bitmaps", {})
+        abs_bm = bm.get("ABS", 0)
+        key_bm = bm.get("KEY", 0)
+
+        score = 0
+        for hint in _FINGER_NAME_HINTS:
+            if hint in name:
+                score += 10
+        # Core multi-touch axes: slot + tracking id + position are the strong
+        # signal that this device reports finger contacts.
+        if has_bit(abs_bm, ABS_MT_SLOT):
+            score += 10
+        if has_bit(abs_bm, ABS_MT_TRACKING_ID):
+            score += 5
+        if has_bit(abs_bm, ABS_MT_POSITION_X) and has_bit(abs_bm, ABS_MT_POSITION_Y):
+            score += 10
+        if has_bit(key_bm, BTN_TOUCH):
+            score += 1
+
+        # Pen indicators push the device away from being a touchscreen.
+        for hint in _PEN_NAME_HINTS:
+            if hint in name:
+                score -= 10
+        if has_bit(abs_bm, ABS_PRESSURE):
+            score -= 8
+        if has_bit(key_bm, BTN_TOOL_PEN):
+            score -= 10
+
+        log.debug("touch candidate %s score=%d name=%r",
+                  d.get("event"), score, d.get("name"))
+        if score > best_score:
+            best_score = score
+            best = d
+
+    # Require a decent score *and* at least one MT axis bit: without MT bits
+    # the "winner" is probably just a keyboard/mouse device with a favourable
+    # name, or a single-touch panel that cannot report the multi-finger
+    # contacts pinch gestures need.
+    if best is not None:
+        best_abs = best.get("bitmaps", {}).get("ABS", 0)
+        has_mt = any(has_bit(best_abs, code) for code in
+                     (ABS_MT_SLOT, ABS_MT_TRACKING_ID,
+                      ABS_MT_POSITION_X, ABS_MT_POSITION_Y))
+        if best_score < 10 or not has_mt:
+            log.debug("no plausible touchscreen device found (best score=%d)",
+                      best_score)
+            return None
+    if best is not None:
+        log.debug("chosen touch device: %s (score=%d)",
+                  best.get("event"), best_score)
     return best
 
 

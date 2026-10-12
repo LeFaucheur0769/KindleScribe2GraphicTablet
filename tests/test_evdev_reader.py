@@ -7,6 +7,10 @@ import pytest
 
 from kindle_draw.evdev_reader import (
     ABS_DISTANCE,
+    ABS_MT_POSITION_X,
+    ABS_MT_POSITION_Y,
+    ABS_MT_SLOT,
+    ABS_MT_TRACKING_ID,
     ABS_PRESSURE,
     ABS_TILT_X,
     ABS_TILT_Y,
@@ -23,6 +27,7 @@ from kindle_draw.evdev_reader import (
     StylusTracker,
     detect_esz,
     find_stylus_device,
+    find_touch_device,
     has_bit,
     parse_input_devices,
     parse_multitoken_bitmap,
@@ -186,6 +191,100 @@ def test_find_stylus_device_pen_name_hint():
 def test_find_stylus_device_returns_none_when_no_candidates():
     assert find_stylus_device([{"raw": "no handlers", "bitmaps": {}}]) is None
     assert find_stylus_device([]) is None
+
+
+# ---------------------------------------------------------------------------
+# find_touch_device
+# ---------------------------------------------------------------------------
+
+# Touchscreen with the full modern MT axis set: ABS=E28000 3 sets
+# ABS_MT_SLOT (47), ABS_MT_TRACKING_ID (53), ABS_MT_POSITION_X (54),
+# ABS_MT_POSITION_Y (55) in word 1 plus ABS_X/Y (0, 1) in word 0.  The name
+# deliberately carries no finger hint so the MT bits alone decide.
+TOUCH_FULL_BLOCK = """I: Bus=0019 Vendor=0001 Product=0001 Version=0100
+N: Name="ATMXT I2C Input"
+P: Phys=
+S: Sysfs=/devices/platform/soc/i2c/input/input7
+U: Uniq=
+H: Handlers=event5
+B: PROP=0
+B: EV=b
+B: KEY=400 0 0 0 0 0 0 0 0 0 0
+B: ABS=E28000 3"""
+
+# Hybrid pen panel: Wacom-style buttons/pressure *plus* MT axes.  The pen
+# penalties (name hints, ABS_PRESSURE, BTN_TOOL_PEN) must outweigh the MT
+# rewards so it never steals the touchscreen role from a real finger panel.
+HYBRID_PEN_BLOCK = """I: Bus=0019 Vendor=056a Product=0001 Version=0100
+N: Name="Wacom Pen and touch"
+P: Phys=usb-0000:01:00.0-2/input0
+S: Sysfs=/devices/platform/soc/usb/input/input8
+U: Uniq=
+H: Handlers=event6
+B: PROP=0
+B: EV=17
+B: KEY=c01 0 0 0 0 0 0 0 0 0 0
+B: ABS=E28000 3000003"""
+
+
+def test_find_touch_device_prefers_touchscreen_over_stylus():
+    # With both the stylus and the touchscreen present, the touchscreen wins:
+    # its name hints + MT_SLOT + BTN_TOUCH beat the stylus's pressure/pen
+    # penalties.
+    devices = parse_input_devices(STYLUS_BLOCK + "\n\n" + TOUCH_BLOCK)
+    chosen = find_touch_device(devices)
+    assert chosen is not None
+    assert chosen["event"] == "/dev/input/event4"
+
+
+def test_find_touch_device_full_mt_axes_win_without_name_hints():
+    # No finger-ish name, but the full ABS_MT_* set clears the threshold.
+    devices = parse_input_devices(TOUCH_FULL_BLOCK)
+    chosen = find_touch_device(devices)
+    assert chosen is not None
+    assert chosen["event"] == "/dev/input/event5"
+    bm = chosen["bitmaps"]["ABS"]
+    assert has_bit(bm, ABS_MT_SLOT)
+    assert has_bit(bm, ABS_MT_TRACKING_ID)
+    assert has_bit(bm, ABS_MT_POSITION_X)
+    assert has_bit(bm, ABS_MT_POSITION_Y)
+
+
+def test_find_touch_device_penalises_pen_indicators():
+    # The hybrid pen+MT device loses to the plain touchscreen, and on its own
+    # its pen penalties drag it below the threshold so it is rejected rather
+    # than mistaken for a finger panel.
+    devices = parse_input_devices(HYBRID_PEN_BLOCK + "\n\n" + TOUCH_BLOCK)
+    chosen = find_touch_device(devices)
+    assert chosen is not None
+    assert chosen["event"] == "/dev/input/event4"
+
+    assert find_touch_device(parse_input_devices(HYBRID_PEN_BLOCK)) is None
+
+
+def test_find_touch_device_returns_none_when_only_stylus_present():
+    # The EMR stylus device has no MT axes and is penalised for pressure and
+    # BTN_TOOL_PEN, so it must never be returned as the touchscreen.
+    devices = parse_input_devices(STYLUS_BLOCK)
+    assert find_touch_device(devices) is None
+
+
+def test_find_touch_device_requires_mt_bits_or_clear_hints():
+    # A favourable name alone is not enough: without any ABS_MT_* axis the
+    # device cannot report multi-finger contacts, so it is rejected.
+    finger_named_no_mt = [{"event": "/dev/input/event9",
+                           "name": "Wacom Touchscreen",   # +20 name, -10 pen
+                           "bitmaps": {"ABS": (1 << ABS_X) | (1 << ABS_Y),
+                                       "KEY": 1 << BTN_TOUCH}}]
+    assert find_touch_device(finger_named_no_mt) is None
+
+    # Keyboard-like device: no name hints, no MT bits.
+    assert find_touch_device([{"event": "/dev/input/event0",
+                               "name": "gpio-keys",
+                               "bitmaps": {"KEY": 1 << 1, "ABS": 0}}]) is None
+
+    assert find_touch_device([]) is None
+    assert find_touch_device([{"raw": "no handlers", "bitmaps": {}}]) is None
 
 
 # ---------------------------------------------------------------------------
