@@ -12,6 +12,8 @@ from typing import Optional, Tuple
 
 from PIL import Image, ImageDraw
 
+from .gestures import GestureEvent, Viewport
+
 try:
     LANCZOS = Image.Resampling.LANCZOS
 except AttributeError:                    # pragma: no cover
@@ -89,13 +91,30 @@ def make_brush(color, size: float, pressure_sensitive: bool = True) -> Brush:
 # --------------------------------------------------------------------------- #
 
 class Canvas:
-    def __init__(self, width: int, height: int, bg=(255, 255, 255)) -> None:
+    """A fixed-size drawing surface with a zoomable/pannable viewport.
+
+    The canvas image itself is always full resolution (``width x height``);
+    the :class:`~kindle_draw.gestures.Viewport` decides which *region* of it
+    ``render_preview`` maps onto the Kindle panel.  Stylus coordinates are
+    converted from view space to canvas space with :meth:`view_to_canvas`
+    before drawing, so you always draw exactly under your pen tip even while
+    zoomed in.  Brush sizes stay in canvas units (a 8 px pen draws 8 canvas
+    pixels regardless of the zoom level, which means it looks *thicker* on
+    screen when zoomed in -- like magnifying paper).
+    """
+
+    def __init__(self, width: int, height: int, bg=(255, 255, 255),
+                 min_scale: float = 1.0, max_scale: float = 8.0) -> None:
         self.width = width
         self.height = height
         self.bg = bg
         self.image = Image.new("RGB", (width, height), bg)
         self.lock = threading.RLock()
         self._draw = ImageDraw.Draw(self.image)
+
+        # Zoom/pan window onto the canvas (see gestures.py for the math).
+        self.viewport = Viewport(width, height, min_scale=min_scale,
+                                 max_scale=max_scale)
 
         # user-tunable brush state
         self._pen_color: Tuple[int, int, int] = (0, 0, 0)
@@ -234,6 +253,85 @@ class Canvas:
             self._draw = ImageDraw.Draw(self.image)
             self._mark((0, 0, self.width, self.height))
 
+    # -- viewport / gestures -------------------------------------------- #
+    #
+    # View coordinates are canvas-normalised: the visible window always maps
+    # onto [0, width] x [0, height] regardless of the zoom level (see the
+    # module docstring in gestures.py).  Gesture mutators bump ``version`` so
+    # the streamer re-renders the preview; they deliberately do *not* touch
+    # ``_dirty`` because canvas-mode updates are version-triggered and diffed
+    # from the rendered preview, not from the dirty box.
+
+    def apply_gesture(self, ev: GestureEvent) -> bool:
+        """Apply a recognised pinch/pan gesture (view units).
+
+        Returns True when the viewport actually changed (and ``version`` was
+        bumped).  A pinch event carries its focal point and pan delta in one
+        composition, so simultaneous zoom+drag stays anchored under the
+        fingers.
+        """
+        with self.lock:
+            if self.viewport.apply_pinch(ev.factor, ev.focal_x, ev.focal_y,
+                                         ev.dx, ev.dy):
+                self.version += 1
+                return True
+            return False
+
+    def zoom_at(self, factor: float, cx: float, cy: float) -> bool:
+        """Zoom around a *view-space* point. Bumps version when changed."""
+        with self.lock:
+            if self.viewport.apply_pinch(factor, cx, cy):
+                self.version += 1
+                return True
+            return False
+
+    def pan_by(self, dx: float, dy: float) -> bool:
+        """Pan the window by a *view-space* delta. Bumps version if changed."""
+        with self.lock:
+            if self.viewport.apply_pan(dx, dy):
+                self.version += 1
+                return True
+            return False
+
+    def reset_viewport(self) -> bool:
+        """Return to scale 1 / offset 0 (whole canvas visible)."""
+        with self.lock:
+            if self.viewport.reset():
+                self.version += 1
+                return True
+            return False
+
+    @property
+    def viewport_identity(self) -> bool:
+        """True when the whole canvas is visible at scale 1 (no zoom/pan)."""
+        with self.lock:
+            return self.viewport.is_identity()
+
+    def view_to_canvas(self, vx: float, vy: float) -> Tuple[float, float]:
+        """Map a view-space point (pen tip on screen) to canvas pixels."""
+        with self.lock:
+            return self.viewport.view_to_canvas(vx, vy)
+
+    def canvas_to_view(self, cx: float, cy: float) -> Tuple[float, float]:
+        """Map canvas pixels to view space (may fall outside the window)."""
+        with self.lock:
+            return self.viewport.canvas_to_view(cx, cy)
+
+    def canvas_to_panel(self, cx: float, cy: float,
+                        pw: int, ph: int) -> Tuple[float, float]:
+        """Map canvas pixels to panel pixels through the current viewport.
+
+        Points outside the visible window map outside the panel; callers
+        should clamp to the panel bounds when drawing cursors.
+        """
+        with self.lock:
+            return self.viewport.canvas_to_panel(cx, cy, pw, ph)
+
+    def viewport_box(self) -> Box:
+        """The visible window in integer canvas pixels (x0, y0, x1, y1)."""
+        with self.lock:
+            return self.viewport.viewport_box()
+
     # -- I/O ------------------------------------------------------------ #
 
     def save_png(self, path: str) -> None:
@@ -247,10 +345,23 @@ class Canvas:
     # -- preview -------------------------------------------------------- #
 
     def render_preview(self, pw: int, ph: int, mode: str = "fit") -> Image.Image:
+        """Render the visible viewport window as a panel-sized grayscale image.
+
+        With an identity viewport this is the whole canvas scaled to the panel
+        (the classic behaviour).  With a zoomed/panned viewport only the
+        window returned by :meth:`viewport_box` is rendered, stretched to fill
+        the panel exactly -- matching ``Viewport.canvas_to_panel`` mapping, so
+        a pen tip at view ``(vx, vy)`` lands at panel pixel
+        ``(vx * pw / width, vy * ph / height)``.  The ``mode`` aspect
+        handling then applies to the cropped window (relevant only when the
+        canvas and panel aspect ratios differ).
+        """
         with self.lock:
-            if (pw, ph) == self.image.size and mode == "fit":
-                return self.image.convert("L")     # was: .copy()
             img = self.image
+            if not self.viewport.is_identity():
+                img = img.crop(self.viewport.viewport_box())
+            if (pw, ph) == img.size and mode == "fit":
+                return img.convert("L")             # was: .copy()
             iw, ih = img.size
             if mode == "stretch":
                 return img.resize((pw, ph), BILINEAR).convert("L")
