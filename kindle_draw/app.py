@@ -32,13 +32,16 @@ from .config import (
     PenConfig,
     StreamConfig,
     StylusConfig,
+    TouchConfig,
 )
 from .evdev_reader import (
     StylusTracker,
     detect_esz,
     find_stylus_device,
+    find_touch_device,
     unpack_event,
 )
+from .gestures import PinchTracker
 from .input_inject import build_injector
 from .kindle_link import KindleLink
 from .pages import PageManager
@@ -97,6 +100,25 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help="Don't read stylus events (display only)")
     p.add_argument("--pressure-min", type=int, default=None)
     p.add_argument("--pressure-max", type=int, default=None)
+
+    # Touch (pinch-zoom / pan on the canvas, canvas inject mode only)
+    g = p.add_argument_group("Touch")
+    g.add_argument("--pinch", action="store_true",
+                   help="Enable two-finger pinch-zoom (and two-finger pan) on "
+                        "the drawing canvas.  Canvas mode only.")
+    g.add_argument("--touch-pan", action="store_true",
+                   help="Also pan with a single finger (default is two-finger "
+                        "pan only, so the stylus does not trigger pans)")
+    g.add_argument("--touch-dev", default=None,
+                   help="Override autodetected touchscreen /dev/input/eventN")
+    g.add_argument("--touch-range", type=int, nargs="+", default=None,
+                   metavar="MIN,MAX",
+                   help="Touchscreen axis range(s) as reported by the kernel: "
+                        "either 'MAX' (min assumed 0) or 'XMIN XMAX YMIN YMAX'. "
+                        "Gives an exact finger-to-canvas mapping; without it "
+                        "the tracker estimates the range from observed events")
+    g.add_argument("--max-zoom", type=float, default=8.0,
+                   help="Maximum pinch zoom factor (default 8.0)")
 
     # Pen
     g = p.add_argument_group("Pen")
@@ -369,6 +391,13 @@ class StylusReader(threading.Thread):
             canvas = self.pages.current()
             cw, ch = canvas.width, canvas.height
             x, y, p = raw_to_canvas(self.cal, ev.x, ev.y, ev.pressure, cw, ch)
+            # Under pinch-zoom the panel shows a zoomed window of the
+            # canvas, so raw_to_canvas output is a *view* coordinate (a
+            # position on the panel, normalised to canvas dimensions).
+            # Map it back to the canvas point visible under the stylus so
+            # drawing stays WYSIWYG at any zoom level.
+            if not canvas.viewport_identity:
+                x, y = canvas.view_to_canvas(x, y)
             x = max(0.0, min(cw - 1.0, x))
             y = max(0.0, min(ch - 1.0, y))
             canvas.set_brush_for(eraser=ev.eraser)
@@ -441,6 +470,104 @@ class StylusReader(threading.Thread):
         pmin = self.cal["pressure"]["min"]
         pmax = self.cal["pressure"]["max"]
         return x, y, normalize_pressure(pmin, pmax, pressure)
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        if self._proc is not None:
+            try:
+                self._proc.terminate()
+            except Exception:
+                pass
+        self.join(timeout=3)
+
+
+class TouchReader(threading.Thread):
+    """Read the Kindle touchscreen stream and turn finger gestures into
+    canvas zoom/pan events (canvas inject mode only).
+
+    The kernel broadcasts input events to every open file descriptor, so
+    reading the touchscreen device here does *not* steal events from the
+    Kindle UI: the UI still receives the same touches and may react to
+    them (see the "Pinch-zoom" section of the README for the caveat).
+
+    Raw MT events go through a shared :class:`PinchTracker`, which emits
+    :class:`GestureEvent` objects once per ``EV_SYN`` frame; each gesture
+    is applied to the current canvas and wakes the streamer so the zoomed
+    view is pushed to the panel promptly.
+    """
+
+    def __init__(
+        self,
+        kindle: KindleLink,
+        dev: str,
+        esz: int,
+        pages: PageManager,
+        streamer: Streamer,
+        stop_event: threading.Event,
+        tracker: PinchTracker,
+    ) -> None:
+        super().__init__(daemon=True, name="TouchReader")
+        self.kindle = kindle
+        self.dev = dev
+        self.esz = esz
+        self.pages = pages
+        self.streamer = streamer
+        self.stop_event = stop_event
+        self.tracker = tracker
+        self._proc: Optional[subprocess.Popen] = None
+
+    def run(self) -> None:
+        log.info("touch reader started on %s (esz=%d)", self.dev, self.esz)
+        backoff = 0.5
+        while not self.stop_event.is_set():
+            try:
+                self._loop()
+                backoff = 0.5
+            except Exception as exc:
+                if self.stop_event.is_set():
+                    break
+                log.warning("touch stream error: %s", exc)
+                time.sleep(backoff)
+                backoff = min(5.0, backoff * 2)
+        log.info("touch reader stopped")
+
+    def _loop(self) -> None:
+        proc = self.kindle.popen(f"cat {self.dev}")
+        self._proc = proc
+        try:
+            # A fresh stream may miss the tail of an in-progress touch;
+            # start clean so stale slots do not leak into new gestures.
+            self.tracker.reset()
+            buf = b""
+            while not self.stop_event.is_set():
+                chunk = proc.stdout.read(self.esz * 64)
+                if not chunk:
+                    if self.stop_event.is_set():
+                        return
+                    raise RuntimeError("touch stream ended")
+                buf += chunk
+                while len(buf) >= self.esz:
+                    ev = buf[:self.esz]
+                    buf = buf[self.esz:]
+                    t, c, v = unpack_event(ev, self.esz)
+                    # Non-MT events (BTN_TOUCH etc.) are ignored by the
+                    # tracker, so it is safe to feed the whole stream.
+                    g = self.tracker.feed(t, c, v)
+                    if g is not None:
+                        self._apply(g)
+        finally:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+            self._proc = None
+
+    def _apply(self, g) -> None:
+        """Apply one gesture to the current page; wake the streamer if it
+        actually changed the viewport (Canvas.version was bumped)."""
+        canvas = self.pages.current()
+        if canvas.apply_gesture(g):
+            self.streamer.wake()
 
     def stop(self) -> None:
         self.stop_event.set()
@@ -598,6 +725,36 @@ def build_config(args: argparse.Namespace) -> AppConfig:
     if getattr(args, "pressure_sensitive", None) is not None:
         pen.pressure_sensitive = bool(args.pressure_sensitive)
 
+    # --- touch (pinch-zoom / pan) ------------------------------------- #
+    touch = TouchConfig()
+    touch.enabled = bool(args.pinch)
+    touch.dev = args.touch_dev
+    touch.pan = bool(args.touch_pan)
+    touch.max_scale = float(args.max_zoom)
+    if touch.max_scale <= 1.0:
+        raise ValueError(f"--max-zoom must be > 1, got {args.max_zoom}")
+    if args.touch_range is not None:
+        vals = list(args.touch_range)
+        if len(vals) == 1:
+            # Single value: treat as the axis maximum, minimum assumed 0.
+            vals = [0, vals[0], 0, vals[0]]
+        if len(vals) != 4:
+            raise ValueError(
+                "--touch-range takes one value (axis max) or four values "
+                "(XMIN XMAX YMIN YMAX), got "
+                + " ".join(str(v) for v in args.touch_range)
+            )
+        if any(v <= 0 for v in vals[1::2]) or any(v < 0 for v in vals[0::2]):
+            raise ValueError(
+                "--touch-range values must be non-negative with positive "
+                "maxima, got " + " ".join(str(v) for v in vals)
+            )
+        if vals[1] <= vals[0] or vals[3] <= vals[2]:
+            raise ValueError(
+                f"--touch-range maxima must exceed minima, got {vals}"
+            )
+        touch.touch_range = tuple(vals)
+
     # --- inject target size ----------------------------------------- #
     is_system_inject = args.inject in ("uinput", "xdotool", "ydotool")
     if is_system_inject:
@@ -651,6 +808,7 @@ def build_config(args: argparse.Namespace) -> AppConfig:
             pressure_min=args.pressure_min,
             pressure_max=args.pressure_max,
         ),
+        touch=touch,
         pen=pen,
         stream=StreamConfig(
             active_wf=args.active_wf,
@@ -828,7 +986,8 @@ def main(argv=None) -> int:
             return 2
 
     # --- components --------------------------------------------------- #
-    pages = PageManager(cfg.canvas_width, cfg.canvas_height)
+    pages = PageManager(cfg.canvas_width, cfg.canvas_height,
+                        max_scale=cfg.touch.max_scale)
     stop_event = threading.Event()
 
     canvas = pages.current()
@@ -905,6 +1064,54 @@ def main(argv=None) -> int:
             cursor_mode=args.cursor,
         )
 
+    # --- touch (pinch-zoom / pan) ------------------------------------- #
+    # A second SSH event stream on the touchscreen device feeds the gesture
+    # tracker.  The kernel broadcasts input events to every open fd, so this
+    # does not steal touches from the Kindle UI (it may still react to them).
+    touch_reader: Optional[TouchReader] = None
+    if cfg.touch.enabled and cfg.inject.mode != "canvas":
+        log.warning("--pinch only works with --inject canvas; ignoring it "
+                    "for inject mode %r", cfg.inject.mode)
+        cfg.touch.enabled = False
+    if cfg.touch.enabled:
+        touch_dev = cfg.touch.dev
+        if touch_dev is None:
+            touch_info = find_touch_device(info["devices"])
+            if touch_info is None:
+                log.warning("no touchscreen device found — pinch-zoom disabled")
+            else:
+                touch_dev = touch_info["event"]
+                log.info("touch device: %s (%s)",
+                         touch_dev, touch_info.get("name"))
+        if touch_dev is None:
+            cfg.touch.enabled = False
+        else:
+            # The kernel input_event struct size is the same for every
+            # device, so reuse the stylus probe when we already have it.
+            touch_esz = esz
+            if touch_esz is None:
+                log.info("probing event struct size — touch the screen now")
+                touch_esz = probe_esz(kindle, touch_dev)
+            tracker = PinchTracker(
+                cfg.canvas_width, cfg.canvas_height,
+                rotation=0,                      # canvas mode is portrait
+                touch_range=cfg.touch.touch_range,
+                enable_pan=cfg.touch.pan,
+            )
+            touch_reader = TouchReader(
+                kindle=kindle,
+                dev=touch_dev,
+                esz=touch_esz,
+                pages=pages,
+                streamer=streamer,
+                stop_event=stop_event,
+                tracker=tracker,
+            )
+            log.info("pinch-zoom: on (max %.1fx, two-finger pan %s, "
+                     "range=%s)", cfg.touch.max_scale,
+                     "on" if cfg.touch.pan else "off",
+                     cfg.touch.touch_range or "auto")
+
     # --- Kindle housekeeping ------------------------------------------ #
     if cfg.no_screensaver:
         try:
@@ -957,9 +1164,20 @@ def main(argv=None) -> int:
         if stream_enabled:
             streamer.wake()
 
+    def _reset_viewport(*_sig) -> None:
+        """SIGUSR2: reset the pinch viewport of the current page to 1:1."""
+        if not (cfg.touch.enabled and stream_enabled):
+            log.info("viewport reset ignored (pinch mode not active)")
+            return
+        changed = pages.current().reset_viewport()
+        log.info("viewport reset: %s", "done" if changed else "already at 1:1")
+        if changed:
+            streamer.wake()
+
     signal.signal(signal.SIGINT, _stop)
     signal.signal(signal.SIGTERM, _stop)
     signal.signal(signal.SIGUSR1, _toggle_sticky)
+    signal.signal(signal.SIGUSR2, _reset_viewport)
 
 
     
@@ -970,6 +1188,8 @@ def main(argv=None) -> int:
         streamer.start()
     if reader is not None:
         reader.start()
+    if touch_reader is not None:
+        touch_reader.start()
 
     log.info("running. inject=%s stream=%s target=%s rotation=%d° sticky=%s",
              cfg.inject.mode,
@@ -994,6 +1214,8 @@ def main(argv=None) -> int:
 
         if reader is not None:
             reader.stop()
+        if touch_reader is not None:
+            touch_reader.stop()
         if stream_enabled:
             streamer.join(timeout=4)
             stroke_logger.stop()

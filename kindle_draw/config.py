@@ -38,6 +38,23 @@ class StylusConfig:
 
 
 @dataclass
+class TouchConfig:
+    """Multi-touch (finger) gesture settings for pinch-zoom/pan in canvas mode.
+
+    The touchscreen device is read through a second SSH ``cat`` stream,
+    independent from the stylus device.  Gestures only make sense in canvas
+    mode (the host-side Pillow canvas owns the viewport); in system-inject
+    modes the flag is ignored with a warning.
+    """
+
+    enabled: bool = False             # --pinch
+    dev: Optional[str] = None         # --touch-dev (None -> autodetect)
+    pan: bool = False                 # --touch-pan: single-finger pan (opt-in)
+    touch_range: Optional[Tuple[int, ...]] = None  # --touch-range: raw min,max pairs
+    max_scale: float = 8.0            # --max-zoom upper bound (> 1)
+
+
+@dataclass
 class PenConfig:
     color: Tuple[int, int, int] = (0, 0, 0)
     size: float = 8.0
@@ -79,6 +96,7 @@ class AppConfig:
     kindle: KindleConfig = field(default_factory=KindleConfig)
     panel: PanelConfig = field(default_factory=PanelConfig)
     stylus: StylusConfig = field(default_factory=StylusConfig)
+    touch: TouchConfig = field(default_factory=TouchConfig)
     pen: PenConfig = field(default_factory=PenConfig)
     stream: StreamConfig = field(default_factory=StreamConfig)
     inject: InjectConfig = field(default_factory=InjectConfig)

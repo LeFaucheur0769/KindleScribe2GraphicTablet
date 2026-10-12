@@ -232,6 +232,14 @@ class Streamer(threading.Thread):
         if canvas is None or self._panel_w is None:
             return None
         cx, cy = pos
+        if hasattr(canvas, "canvas_to_panel"):
+            # Viewport-aware: push the canvas point back through the
+            # current zoom/pan window onto the panel.  Since the stylus
+            # reader converts panel -> canvas with view_to_canvas, this
+            # lands the cursor at the stylus' physical panel position at
+            # any zoom level.
+            return canvas.canvas_to_panel(cx, cy, self._panel_w,
+                                          self._panel_h)
         px = cx * self._panel_w / max(1, canvas.width)
         py = cy * self._panel_h / max(1, canvas.height)
         return px, py
