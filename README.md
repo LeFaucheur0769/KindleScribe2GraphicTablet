@@ -122,6 +122,10 @@ flag. Password auth works via `--password` or `$KINDLE_SSH_PASSWORD`
 | `--save-png`, `--save-pdf`, `--save-json`, `--autosave SEC` | Canvas output (canvas mode) |
 | `--active-wf`, `--clean-wf`, `--flash-wf`, `--fps`, `--threshold` | FBInk streaming tuning (canvas mode) |
 | `--cursor off\|hover\|always` | Hover reticle on the Kindle (canvas mode) |
+| `--pinch` | Enable two-finger pinch-zoom/pan on the canvas (canvas mode) |
+| `--touch-pan` | Also pan with a *single* finger (default: two fingers only) |
+| `--touch-dev PATH` / `--touch-range ...` | Touchscreen device / raw-axis overrides for `--pinch` |
+| `--max-zoom F` | Zoom ceiling for `--pinch` (default 8×) |
 | `--gui` | Also open a host-side Tkinter window mirroring the canvas |
 | `--freeze-ui` | SIGSTOP the Kindle window manager while running |
 | `-v`, `-vv` | More logging |
@@ -139,10 +143,68 @@ Re-run `--calibrate` if strokes land offset, or hand-edit the JSON.
 
 ---
 
+## Pinch zoom and pan (canvas mode)
+
+`--pinch` adds multi-touch zooming to the canvas. The app opens a second
+SSH `cat` stream on the Kindle's touchscreen device (auto-detected, or
+set it with `--touch-dev /dev/input/eventN`) and turns raw
+`ABS_MT_*` events into gestures:
+
+- **Pinch two fingers** — zoom in/out around the finger midpoint.
+- **Drag two fingers** — pan the visible window.
+- **Drag one finger** — pan, if you also pass `--touch-pan` (off by
+  default so a resting stylus-induced contact does not move the view).
+
+```bash
+kindle-draw --pinch                 # pinch-zoom + two-finger pan
+kindle-draw --pinch --touch-pan     # also single-finger pan
+kindle-draw --pinch --max-zoom 4    # cap zoom at 4x (default 8x)
+```
+
+Each page keeps its own viewport; zooming never changes the canvas
+itself, only which window of it is streamed to the panel.
+
+**Drawing while zoomed.** The stylus draws to the canvas point that is
+visible under its tip (what you see is what you get). Brush and eraser
+widths stay in canvas units, so a stroke looks `zoom`-times thicker on
+the panel while zoomed in — fine for detail work, just be aware of it
+before saving.
+
+**Resetting the view.** Send `SIGUSR2` to the process to snap the
+current page back to 1:1:
+
+```bash
+kill -USR2 $(pgrep -f kindle-draw)
+```
+
+**Exact touch mapping.** Gesture positions are mapped from the
+touchscreen's raw axis range to the canvas. Without calibration data
+the app adapts to the range your fingers actually produce, which is
+good enough for comfortable zooming but can mis-anchor the zoom focal
+point. For an exact mapping, read the real axis limits on the Kindle
+(`cat /proc/bus/input/devices`, or `evtest`) and pass them:
+
+```bash
+kindle-draw --pinch --touch-range 0 32767 0 32767
+# or one value if both axes share a max:  --touch-range 4095
+```
+
+**Caveats.**
+
+- The Kindle UI still receives the same touch events (the kernel
+  broadcasts input events to every open reader), so the Scribe's own
+  interface may also react while you pinch. `--freeze-ui` can suppress
+  that.
+- A zoom or pan changes the whole streamed preview, so the next frame
+  is a full-panel refresh rather than a small diff.
+
+---
+
 ## Tests
 
 The pure-logic parts (calibration math, evdev/uinput parsing, stylus
-state machine, streamer geometry/diff helpers) have a pytest suite:
+state machine, pinch/pan gesture tracking, streamer geometry/diff
+helpers) have a pytest suite:
 
 ```bash
 pytest          # works straight from a checkout, no install needed
@@ -162,6 +224,8 @@ The SSH, FBInk, and GUI paths are not covered — those need real hardware.
   remotely is not a supported setup).
 - macOS/Windows: canvas mode can work with extra plumbing, uinput mode
   is Linux-only by definition.
+- Pinch zoom (`--pinch`) is canvas-mode only; in uinput mode zoom is
+  whatever the host application provides.
 
 ## License
 
