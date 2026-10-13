@@ -38,9 +38,9 @@ MT_CODES = set(range(0x2f, 0x40))
 # Named members of MT_CODES (kernel input-event-codes.h values) used by the
 # touchscreen device heuristic.
 ABS_MT_SLOT        = 0x2f  # 47
-ABS_MT_TRACKING_ID = 0x35  # 53
-ABS_MT_POSITION_X  = 0x36  # 54
-ABS_MT_POSITION_Y  = 0x37  # 55
+ABS_MT_TRACKING_ID = 0x39  # 57
+ABS_MT_POSITION_X  = 0x35  # 53
+ABS_MT_POSITION_Y  = 0x36  # 54
 
 _EVENT_64 = struct.Struct("<qqHHi")
 _EVENT_32 = struct.Struct("<IIHHi")

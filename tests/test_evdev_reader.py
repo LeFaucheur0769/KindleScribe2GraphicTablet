@@ -197,10 +197,11 @@ def test_find_stylus_device_returns_none_when_no_candidates():
 # find_touch_device
 # ---------------------------------------------------------------------------
 
-# Touchscreen with the full modern MT axis set: ABS=E28000 3 sets
-# ABS_MT_SLOT (47), ABS_MT_TRACKING_ID (53), ABS_MT_POSITION_X (54),
-# ABS_MT_POSITION_Y (55) in word 1 plus ABS_X/Y (0, 1) in word 0.  The name
-# deliberately carries no finger hint so the MT bits alone decide.
+# Touchscreen with the full modern MT axis set: ABS=2E08000 3 sets
+# ABS_MT_SLOT (47), ABS_MT_POSITION_X (53), ABS_MT_POSITION_Y (54),
+# ABS_MT_TOOL_TYPE (55) and ABS_MT_TRACKING_ID (57) in word 1 (bits 15,
+# 21-23, 25) plus ABS_X/Y (0, 1) in word 0.  The name deliberately carries
+# no finger hint so the MT bits alone decide.
 TOUCH_FULL_BLOCK = """I: Bus=0019 Vendor=0001 Product=0001 Version=0100
 N: Name="ATMXT I2C Input"
 P: Phys=
@@ -210,7 +211,7 @@ H: Handlers=event5
 B: PROP=0
 B: EV=b
 B: KEY=400 0 0 0 0 0 0 0 0 0 0
-B: ABS=E28000 3"""
+B: ABS=2E08000 3"""
 
 # Hybrid pen panel: Wacom-style buttons/pressure *plus* MT axes.  The pen
 # penalties (name hints, ABS_PRESSURE, BTN_TOOL_PEN) must outweigh the MT
@@ -224,7 +225,7 @@ H: Handlers=event6
 B: PROP=0
 B: EV=17
 B: KEY=c01 0 0 0 0 0 0 0 0 0 0
-B: ABS=E28000 3000003"""
+B: ABS=2E08000 3000003"""
 
 
 def test_find_touch_device_prefers_touchscreen_over_stylus():

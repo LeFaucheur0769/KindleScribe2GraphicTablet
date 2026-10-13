@@ -8,10 +8,14 @@ from kindle_draw.gestures import (
     ABS_MT_POSITION_X,
     ABS_MT_POSITION_Y,
     ABS_MT_SLOT,
+    ABS_MT_TOOL_TYPE,
     ABS_MT_TRACKING_ID,
     EV_ABS,
     EV_KEY,
     EV_SYN,
+    MT_TOOL_FINGER,
+    MT_TOOL_PALM,
+    MT_TOOL_PEN,
     PinchTracker,
     Viewport,
 )
@@ -131,7 +135,7 @@ def test_reset():
 # PinchTracker: protocol-B slot bookkeeping
 # ---------------------------------------------------------------------------
 
-def _slot(tracker, slot, tid=None, x=None, y=None):
+def _slot(tracker, slot, tid=None, x=None, y=None, tool=None):
     """Feed one slot's worth of MT-B events, closed by an EV_SYN frame.
 
     The kernel groups all slot updates for one sampling instant into a frame
@@ -146,6 +150,8 @@ def _slot(tracker, slot, tid=None, x=None, y=None):
         tracker.feed(EV_ABS, ABS_MT_POSITION_X, x)
     if y is not None:
         tracker.feed(EV_ABS, ABS_MT_POSITION_Y, y)
+    if tool is not None:
+        tracker.feed(EV_ABS, ABS_MT_TOOL_TYPE, tool)
     return tracker.feed(EV_SYN, 0, 0)
 
 
@@ -301,3 +307,124 @@ def test_rotation_90_maps_deltas_through_rotation():
     ev = _slot(tr, 0, x=600, y=500)
     assert ev is not None and ev.kind == "pan"
     assert (ev.dx, ev.dy) == pytest.approx((0.0, 100.0))
+
+
+# ---------------------------------------------------------------------------
+# PinchTracker: ABS_MT_TOOL_TYPE filtering (stylus / palm rejection)
+# ---------------------------------------------------------------------------
+
+def test_pen_contact_excluded_from_pinch_pair():
+    # A hybrid touchscreen that reports the stylus through the MT slots must
+    # not let the pen hijack the pinch pair.  The pen sits far from the two
+    # fingers, so if it were counted the max-spread pair (pen + far finger)
+    # would produce a completely different factor and midpoint than the
+    # finger-only pair the tracker must actually report.
+    tr = PinchTracker(1860, 2480, touch_range=(1860, 2480))
+    assert _slot(tr, 0, tid=10, x=100, y=100, tool=MT_TOOL_PEN) is None
+    assert _slot(tr, 1, tid=11, x=1400, y=2000, tool=MT_TOOL_FINGER) is None
+    # Finger baseline: spread 100*sqrt2, midpoint (1450, 2050).  A pen-aware
+    # tracker would instead pick the pen-slot2 pair (spread ~2441, midpoint
+    # (800, 1100)).
+    assert _slot(tr, 2, tid=12, x=1500, y=2100, tool=MT_TOOL_FINGER) is None
+    # A still pen frame leaves the usable set untouched: gesture intact,
+    # nothing moved, nothing emitted.
+    assert _slot(tr, 0, x=100, y=100) is None
+    # Spread the finger pair: 100*sqrt2 -> 150*sqrt2 = factor 1.5.  A
+    # pen-inclusive tracker would report the pen-slot2 pair instead: factor
+    # ~1.03, midpoint (825, 1125).
+    ev = _slot(tr, 2, x=1550, y=2150)
+    assert ev is not None and ev.kind == "pinch"
+    assert ev.factor == pytest.approx(1.5)
+    # Midpoint of the two fingers only: ((1400+1550)/2, (2000+2150)/2).
+    assert (ev.focal_x, ev.focal_y) == pytest.approx((1475.0, 2075.0))
+    # Midpoint moved (1450, 2050) -> (1475, 2075).
+    assert (ev.dx, ev.dy) == pytest.approx((25.0, 25.0))
+
+
+def test_pen_plus_one_finger_is_not_a_pinch():
+    # One finger + one pen contact: only one *usable* touch contact, so no
+    # pinch event is emitted (the pen alone must not zoom the canvas).
+    tr = PinchTracker(1860, 2480, touch_range=(1860, 2480))
+    assert _slot(tr, 0, tid=10, x=1000, y=1000, tool=MT_TOOL_PEN) is None
+    assert _slot(tr, 1, tid=11, x=1200, y=1200, tool=MT_TOOL_FINGER) is None
+    assert _slot(tr, 1, x=1300, y=1300) is None  # single usable contact
+
+
+def test_pen_appearing_mid_pinch_does_not_reset_baseline():
+    # The baseline reset is keyed on the *usable* contact identity, so a pen
+    # contact joining an in-progress two-finger pinch must not tear the
+    # gesture down: the next finger move still reports the true 1.5 factor
+    # against the original finger baseline (a reset would report factor 1.0
+    # and swallow the frame).
+    tr = PinchTracker(1860, 2480, touch_range=(1860, 2480))
+    assert _slot(tr, 0, tid=10, x=1200, y=1800, tool=MT_TOOL_FINGER) is None
+    assert _slot(tr, 1, tid=11, x=1400, y=2000, tool=MT_TOOL_FINGER) is None
+    # Pen joins while the fingers hold still.
+    assert _slot(tr, 2, tid=12, x=300, y=300, tool=MT_TOOL_PEN) is None
+    # Fingers spread: the usable identity set is unchanged, so the pair
+    # baseline from the previous frames is kept and this first moving frame
+    # reports baseline 200*sqrt2 -> 300*sqrt2 = factor 1.5 intact.  (A reset
+    # would instead re-baseline here and emit nothing.)
+    ev = _slot(tr, 0, x=1100, y=1700)
+    assert ev is not None and ev.kind == "pinch"
+    assert ev.factor == pytest.approx(1.5)
+    assert (ev.focal_x, ev.focal_y) == pytest.approx((1250.0, 1850.0))
+    assert (ev.dx, ev.dy) == pytest.approx((-50.0, -50.0))
+    # Following frame where nothing moves further: no event.
+    assert _slot(tr, 1, x=1400, y=2000) is None
+
+
+def test_palm_contact_rejected():
+    # MT_TOOL_PALM contacts are ignored like pen contacts: palm + one finger
+    # must not produce a pinch.
+    tr = PinchTracker(1860, 2480, touch_range=(1860, 2480))
+    assert _slot(tr, 0, tid=10, x=500, y=500, tool=MT_TOOL_PALM) is None
+    assert _slot(tr, 1, tid=11, x=700, y=700, tool=MT_TOOL_FINGER) is None
+    assert _slot(tr, 1, x=800, y=800) is None
+
+
+def test_tool_type_none_counts_as_finger():
+    # Drivers that never report ABS_MT_TOOL_TYPE leave tool None; those
+    # contacts must stay usable (this is the normal finger-only case).
+    tr = PinchTracker(1860, 2480, touch_range=(1860, 2480))
+    assert _slot(tr, 0, tid=10, x=1200, y=1800) is None
+    assert _slot(tr, 1, tid=11, x=1400, y=2000) is None
+    ev = _slot(tr, 0, x=1100, y=1700)
+    assert ev is not None and ev.kind == "pinch"
+    assert ev.factor == pytest.approx(1.5)
+
+
+# ---------------------------------------------------------------------------
+# Integration: pinch anchors the canvas point under the fingers, not the
+# screen centre (the regression the wrong ABS_MT_* constants caused).
+# ---------------------------------------------------------------------------
+
+def test_pinch_anchors_at_fingers_not_screen_centre():
+    # Two fingers pinch-open around (1250, 1850) on a 1860x2480 Scribe panel,
+    # well off-centre.  The focal point must be the finger midpoint, the drag
+    # the midpoint movement, and the resulting viewport must keep the canvas
+    # point under the fingers pinned to the same panel position.
+    tr = PinchTracker(1860, 2480)  # adaptive bounds: raw max <= canvas dims
+    assert _slot(tr, 0, tid=10, x=1200, y=1800) is None
+    assert _slot(tr, 1, tid=11, x=1400, y=2000) is None
+    ev = _slot(tr, 0, x=1100, y=1700)  # spread 200*sqrt2 -> 300*sqrt2
+    assert ev is not None and ev.kind == "pinch"
+    # Focal = current finger midpoint (1250, 1850), NOT the panel centre
+    # (930, 1240) the buggy build anchored to.
+    assert (ev.focal_x, ev.focal_y) == pytest.approx((1250.0, 1850.0))
+    assert ev.factor == pytest.approx(1.5)
+    # Midpoint moved (1300, 1900) -> (1250, 1850).
+    assert (ev.dx, ev.dy) == pytest.approx((-50.0, -50.0))
+
+    vp = Viewport(1860, 2480)
+    assert vp.apply_pinch(ev.factor, ev.focal_x, ev.focal_y, ev.dx, ev.dy) is True
+    assert vp.scale == pytest.approx(1.5)
+    # offset' = 0 + f/s - (f + d)/s' = 1250 - 1200/1.5 = 450 (x),
+    #                       1850 - 1800/1.5 = 650 (y); both inside the clamps
+    # (620 and 826.67), so no clamping distorts the anchor.
+    assert vp.offset_x == pytest.approx(450.0)
+    assert vp.offset_y == pytest.approx(650.0)
+    # The canvas point that was under the fingers' midpoint maps back to the
+    # panel position the fingers are at now: WYSIWYG anchoring.
+    panel = vp.canvas_to_panel(1250.0, 1850.0, 1860, 2480)
+    assert panel == pytest.approx((1200.0, 1800.0))

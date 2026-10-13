@@ -61,17 +61,25 @@ Touch-device scaling
 --------------------
 
 The touchscreen reports raw device units whose absolute range is not exposed
-by ``/proc/bus/input/devices``.  To convert raw deltas and midpoints into
-view units the tracker scales by ``canvas_dim / span`` where ``span`` is::
+by ``/proc/bus/input/devices``.  To convert raw coordinates into view units the
+tracker maps ``raw -> (raw - offset) * canvas_dim / span`` where ``span`` is::
 
-* the ``touch_range`` override supplied by the caller (exact, recommended), or
-* an adaptive estimate from the min/max raw coordinates observed so far,
-  floored at ``canvas_dim`` so that a tiny observed finger spread does not
-  amplify noise into huge pans.
+* the ``touch_range`` override supplied by the caller (exact, recommended; the
+  app seeds it from ``getevent -p`` device capabilities when available), or
+* an adaptive fallback that pins ``offset`` to 0 and takes
+  ``span = max(maximum raw coordinate seen, canvas_dim)``.
 
-With the adaptive estimate the scaling converges towards the true device
-ratio as the user moves fingers across the screen; pass ``--touch-range`` for
-an exact mapping.
+The fallback assumes the panel reports its full range from 0, which is what
+touchscreens do (their capability minimum is always 0).  Pinning the offset
+matters for anchoring: using the smallest coordinate *observed so far* as the
+origin would place the focal point of a pinch near the top-left corner whenever
+the two fingers stay close together (a typical pinch spans 200-600 raw units on
+a 1860-wide panel), and a new extreme reported mid-gesture would shift the
+origin and inject a spurious pan.  Flooring the span at ``canvas_dim`` keeps
+raw deltas mapping 1:1 when the device range equals the canvas, and only ever
+shrinks them (never amplifies) when it is larger.  The estimate self-corrects
+once a finger reaches the far edge of the panel; pass ``--touch-range`` for an
+exact mapping.
 
 Caveats
 -------
@@ -92,15 +100,39 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 from .calibration import apply_rotation
 
-# evdev event types / codes we care about (linux/input.h).
 EV_SYN = 0
 EV_KEY = 1
 EV_ABS = 3
 
-ABS_MT_SLOT = 47
-ABS_MT_TRACKING_ID = 53
-ABS_MT_POSITION_X = 54
-ABS_MT_POSITION_Y = 55
+ABS_MT_SLOT        = 0x2f  # 47
+ABS_MT_ORIENTATION = 0x34  # 52
+ABS_MT_POSITION_X  = 0x35  # 53
+ABS_MT_POSITION_Y  = 0x36  # 54
+ABS_MT_TOOL_TYPE   = 0x37  # 55
+ABS_MT_TRACKING_ID = 0x39  # 57
+
+# ``ABS_MT_TOOL_TYPE`` values (linux/input-event-codes.h).  On a hybrid panel
+# such as the Scribe the stylus can be reported through the *same* multi-touch
+# slots as fingers, tagged MT_TOOL_PEN.  Such a contact must not take part in a
+# pinch: it would become one of the pair's "fingers" and drag the zoom focus to
+# wherever the pen happens to be.  Palms (accidental touches) are excluded too.
+MT_TOOL_FINGER  = 0
+MT_TOOL_PEN     = 1
+MT_TOOL_PALM    = 2
+MT_TOOL_DIAL    = 4
+MT_TOOL_UNKNOWN = 255
+_NON_TOUCH_TOOLS = frozenset({MT_TOOL_PEN, MT_TOOL_PALM, MT_TOOL_DIAL})
+
+
+def _is_touch_tool(tool: Optional[int]) -> bool:
+    """Whether a contact tagged with this tool type may drive pinch/pan.
+
+    ``None`` means the axis was never reported for the contact (or the device
+    does not report it at all), which is the normal case on finger-only
+    touchscreens, so it is accepted.  ``MT_TOOL_UNKNOWN`` is accepted as well:
+    a contact we cannot classify is more likely a finger than a pen.
+    """
+    return tool is None or tool not in _NON_TOUCH_TOOLS
 
 Box = Tuple[int, int, int, int]
 
@@ -276,8 +308,12 @@ class PinchTracker:
     :func:`kindle_draw.evdev_reader.parse_events` (or the raw ``evtest``
     stream parsed into ints).  It tracks protocol-B slots, keeps a baseline
     (midpoint + spread) per contact-count so that each position update yields
-    the *delta* since the previous update, and resets the baseline whenever
-    the contact count changes so lifting/adding fingers never causes a jump.
+    the *delta* since the previous update.  The baseline is reset when the
+    *identity* of the usable contact set changes (slot + tracking id), so
+    lifting/adding/swapping fingers never causes a jump while a driver that
+    re-announces the same tracking id every frame does not break the gesture.
+    Contacts tagged with a non-touch tool type (pen/palm) are ignored, which
+    keeps a stylus reported through the MT slots from hijacking the pinch.
 
     Parameters
     ----------
@@ -288,8 +324,10 @@ class PinchTracker:
         :func:`kindle_draw.calibration.apply_rotation`.  Canvas mode uses 0.
     touch_range:
         ``(max_x, max_y)`` or ``(min_x, max_x, min_y, max_y)`` raw device
-        range override for exact raw->view scaling.  ``None`` enables the
-        adaptive observed-bounds heuristic.
+        range override for exact raw->view scaling.  ``None`` uses the
+        adaptive fallback: origin pinned at 0 (touchscreens always report a
+        capability minimum of 0), span = largest raw coordinate observed so
+        far, floored at the canvas size.  See :meth:`_axis_span`.
     enable_pan:
         When True a *single* finger drag emits ``"pan"`` events.  Default
         False: the Scribe stylus can generate stray single-contact MT events,
@@ -316,13 +354,17 @@ class PinchTracker:
         self.max_step = max(1.0, float(max_step))
 
         # Active contacts: slot -> {"id": float, "x": float|None, "y":
-        # float|None} in raw device units.  Protocol B: ABS_MT_SLOT selects
-        # the slot the following ABS_MT_* events belong to.  Coordinates are
-        # None until both axes have been observed for that contact.
+        # float|None, "tool": int|None} in raw device units.  Protocol B:
+        # ABS_MT_SLOT selects the slot the following ABS_MT_* events belong
+        # to.  Coordinates are None until both axes have been observed for
+        # that contact; tool is None until (or unless) the driver reports
+        # ABS_MT_TOOL_TYPE for it.
         self._slots: Dict[int, Dict[str, Optional[float]]] = {}
         self._cur_slot = 0
 
-        # Adaptive raw-coordinate bounds (None until observed).
+        # Adaptive raw-coordinate bounds (None until observed).  Only the
+        # maxima feed the raw->view mapping (see _axis_span); the minima are
+        # tracked purely as diagnostics.
         self._min_x: Optional[float] = None
         self._max_x: Optional[float] = None
         self._min_y: Optional[float] = None
@@ -347,11 +389,17 @@ class PinchTracker:
         self._pair: Optional[Tuple[float, float, float]] = None   # mid_x, mid_y, spread
         self._single: Optional[Tuple[float, float]] = None        # x, y
 
+        # Identity of the usable contact set at the last evaluation:
+        # frozenset of (slot, tracking id).  Compared in _evaluate to decide
+        # when the baselines must be reset.
+        self._prev_keys: frozenset = frozenset()
+
     # -- public --------------------------------------------------------------- #
 
     @property
     def contacts(self) -> int:
-        """Number of currently tracked contacts."""
+        """Number of currently tracked slots (raw count, including contacts
+        tagged with a non-touch tool type that do not drive gestures)."""
         return len(self._slots)
 
     def reset(self) -> None:
@@ -360,6 +408,7 @@ class PinchTracker:
         self._cur_slot = 0
         self._pair = None
         self._single = None
+        self._prev_keys = frozenset()
 
     def feed(self, t: int, c: int, v: int) -> Optional[GestureEvent]:
         """Consume one ``(type, code, value)`` event.
@@ -389,23 +438,37 @@ class PinchTracker:
                 # ABS_MT_TRACKING_ID before its position events, and the
                 # tracker must not evaluate a half-initialised contact
                 # (otherwise the missing axis reads as 0 and produces a
-                # bogus baseline / spurious pan).
-                slot = self._slots.setdefault(self._cur_slot,
-                                              {"x": None, "y": None})
-                slot["id"] = float(v)
-            self._pair = None
-            self._single = None
+                # bogus baseline / spurious pan).  No baseline reset here:
+                # _evaluate resets when the *usable contact identity*
+                # actually changes, so a pen/palm contact appearing mid-
+                # pinch (or a driver re-announcing the same id) no longer
+                # tears down an in-progress gesture.
+                self._slots[self._cur_slot] = {"id": float(v), "x": None,
+                                                "y": None, "tool": None}
+            return None
+
+        if c == ABS_MT_TOOL_TYPE:
+            # Some drivers tag each contact with its tool type (finger/pen/
+            # palm/dial).  Track it per slot so a stylus reported through the
+            # MT slots cannot hijack the pinch pair; drivers that never send
+            # this code leave tool as None, which counts as a finger.
+            slot = self._slots.setdefault(self._cur_slot,
+                                          {"id": -2.0, "x": None, "y": None,
+                                           "tool": None})
+            slot["tool"] = int(v)
             return None
 
         if c == ABS_MT_POSITION_X:
             slot = self._slots.setdefault(self._cur_slot,
-                                          {"id": -2.0, "x": None, "y": None})
+                                          {"id": -2.0, "x": None, "y": None,
+                                           "tool": None})
             slot["x"] = float(v)
             self._observe(v, x=True)
             return None
         if c == ABS_MT_POSITION_Y:
             slot = self._slots.setdefault(self._cur_slot,
-                                          {"id": -2.0, "x": None, "y": None})
+                                          {"id": -2.0, "x": None, "y": None,
+                                           "tool": None})
             slot["y"] = float(v)
             self._observe(v, x=False)
             return None
@@ -415,12 +478,34 @@ class PinchTracker:
 
     def _evaluate(self) -> Optional[GestureEvent]:
         """Compare current contact geometry against the stored baseline."""
-        # Only contacts with *both* axes observed participate: a contact just
-        # announced by ABS_MT_TRACKING_ID has no coordinates yet, and one
-        # that has only seen POSITION_X would otherwise evaluate against a
-        # phantom y=0 baseline.
-        contacts = [s for s in self._slots.values()
-                    if s["x"] is not None and s["y"] is not None]
+        # A contact is *usable* only when both axes have been observed and it
+        # carries a touch tool type.  A contact just announced by
+        # ABS_MT_TRACKING_ID has no coordinates yet, and one that has only
+        # seen POSITION_X would otherwise evaluate against a phantom y=0
+        # baseline.  Contacts tagged pen/palm/dial are excluded so a stylus
+        # reported through the MT slots cannot hijack the pinch pair; drivers
+        # that never report ABS_MT_TOOL_TYPE leave tool None, which counts as
+        # a finger.
+        usable = [(slot, s) for slot, s in self._slots.items()
+                  if s["x"] is not None and s["y"] is not None
+                  and _is_touch_tool(s.get("tool"))]
+
+        # Reset the baselines only when the *identity* of the usable contact
+        # set changes, keyed by (slot, tracking id).  Lifting, adding or
+        # swapping fingers changes the geometry the baseline describes, so the
+        # next frame establishes a fresh baseline instead of emitting a jump.
+        # A pen/palm contact appearing or disappearing mid-pinch leaves this
+        # set untouched (the gesture survives), and a driver that re-announces
+        # the same tracking id every frame no longer tears the baseline down.
+        # The kernel never reuses tracking ids, so (slot, id) cannot alias a
+        # different physical contact.
+        keys = frozenset((slot, s["id"]) for slot, s in usable)
+        if keys != self._prev_keys:
+            self._pair = None
+            self._single = None
+        self._prev_keys = keys
+
+        contacts = [s for _, s in usable]
         n = len(contacts)
         if n >= 2:
             self._single = None
@@ -484,7 +569,11 @@ class PinchTracker:
     # -- raw -> view conversion -------------------------------------------------- #
 
     def _observe(self, value: int, *, x: bool) -> None:
-        """Grow the adaptive raw bounds with one observed coordinate."""
+        """Grow the adaptive raw bounds with one observed coordinate.
+
+        Only the maxima matter for the raw->view mapping (see
+        :meth:`_axis_span`); the minima are tracked purely as diagnostics.
+        """
         v = float(value)
         if x:
             self._min_x = v if self._min_x is None else min(self._min_x, v)
@@ -493,26 +582,33 @@ class PinchTracker:
             self._min_y = v if self._min_y is None else min(self._min_y, v)
             self._max_y = v if self._max_y is None else max(self._max_y, v)
 
-    def _axis_span(self, lo: Optional[float], hi: Optional[float],
+    def _axis_span(self, hi: Optional[float],
                    fixed: Optional[Tuple[float, float]],
                    canvas_dim: float) -> Tuple[float, float]:
-        """Return ``(offset, span)`` for one axis in raw units."""
+        """Return ``(offset, span)`` for one axis in raw units.
+
+        With a fixed ``touch_range`` override the offset is the configured
+        minimum and the span the configured width.  Otherwise the adaptive
+        fallback pins the offset to 0 -- touchscreens always report a
+        capability minimum of 0 -- and spans the largest raw coordinate
+        observed so far, floored at ``canvas_dim`` so a small observed spread
+        does not amplify noise.  Using the observed *minimum* as the origin
+        instead would shift the mapping mid-gesture and drag the zoom anchor
+        toward the middle of the screen.
+        """
         if fixed is not None:
             off, top = fixed
             return off, max(top - off, 1.0)
-        if lo is None or hi is None:
+        if hi is None:
             return 0.0, canvas_dim
-        observed = hi - lo
-        # Floor at canvas_dim so a small observed spread does not amplify
-        # noise; the estimate converges as the user covers more of the screen.
-        return lo, max(observed, canvas_dim)
+        return 0.0, max(hi, canvas_dim)
 
     def _raw_to_view(self, x: float, y: float) -> Tuple[float, float]:
         """Map raw device coordinates to canvas-space view units."""
-        off_x, span_x = self._axis_span(self._min_x, self._max_x,
-                                        self._fixed_x, self.canvas_w)
-        off_y, span_y = self._axis_span(self._min_y, self._max_y,
-                                        self._fixed_y, self.canvas_h)
+        off_x, span_x = self._axis_span(self._max_x, self._fixed_x,
+                                        self.canvas_w)
+        off_y, span_y = self._axis_span(self._max_y, self._fixed_y,
+                                        self.canvas_h)
         cx = (x - off_x) * self.canvas_w / span_x
         cy = (y - off_y) * self.canvas_h / span_y
         if self.rotation:
