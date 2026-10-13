@@ -7,6 +7,7 @@ streamer skip work when nothing has changed.
 
 from __future__ import annotations
 
+import math
 import threading
 from typing import Optional, Tuple
 
@@ -87,6 +88,38 @@ def make_brush(color, size: float, pressure_sensitive: bool = True) -> Brush:
 
 
 # --------------------------------------------------------------------------- #
+# Pen scaling helper                                                          #
+# --------------------------------------------------------------------------- #
+
+def pen_zoom_factor(scale: float, resolution: int = 1,
+                    log_scaling: bool = True) -> float:
+    """Multiplier applied to brush widths (in canvas pixels) at a given zoom.
+
+    Pen sizes are configured in *panel* pixels (what the user sees at 1:1).
+    The canvas buffer is ``resolution`` times bigger than the panel, so a
+    stroke must be drawn ``resolution`` times wider in canvas units just to
+    look the same size on screen.  On top of that, with ``log_scaling`` the
+    width grows logarithmically with the zoom factor so that ink gets a
+    little thicker as you zoom in (like magnifying paper, but tamed) instead
+    of ballooning linearly:
+
+        on-screen width = size * (1 + ln(scale))      [log mode]
+        on-screen width = size                        [fixed mode]
+
+    The logarithmic term is clamped at 0.5 so strokes never vanish if the
+    viewport is ever allowed to zoom *out* below 1:1.
+
+    Examples (resolution 4, pen size 8 panel px):
+      scale 1 -> factor 4.0   -> 32 canvas px -> 8 px on screen
+      scale 2 -> factor 3.39  -> 27.1 canvas px -> ~13.5 px on screen
+      scale 4 -> factor 2.39  -> 19.1 canvas px -> ~19.1 px on screen (1:1)
+    """
+    scale = max(1e-6, float(scale))
+    growth = 1.0 + math.log(scale) if log_scaling else 1.0
+    return max(0.5, growth) * float(resolution) / scale
+
+
+# --------------------------------------------------------------------------- #
 # Canvas                                                                     #
 # --------------------------------------------------------------------------- #
 
@@ -98,16 +131,24 @@ class Canvas:
     ``render_preview`` maps onto the Kindle panel.  Stylus coordinates are
     converted from view space to canvas space with :meth:`view_to_canvas`
     before drawing, so you always draw exactly under your pen tip even while
-    zoomed in.  Brush sizes stay in canvas units (a 8 px pen draws 8 canvas
-    pixels regardless of the zoom level, which means it looks *thicker* on
-    screen when zoomed in -- like magnifying paper).
+    zoomed in.  Brush widths are configured in *panel* pixels and converted
+    to canvas units at draw time via :func:`pen_zoom_factor`: the canvas
+    ``resolution`` factor keeps the on-screen size constant at 1:1, and the
+    logarithmic zoom term makes ink grow gently (``size * (1 + ln scale)``
+    on screen) as you zoom in -- unless log scaling is disabled with
+    :meth:`set_log_pen_scaling`, which keeps the on-screen width constant at
+    every zoom level.
     """
 
     def __init__(self, width: int, height: int, bg=(255, 255, 255),
-                 min_scale: float = 1.0, max_scale: float = 8.0) -> None:
+                 min_scale: float = 1.0, max_scale: float = 4.0,
+                 resolution: int = 1) -> None:
         self.width = width
         self.height = height
         self.bg = bg
+        # Drawing-buffer size relative to the panel (1..4).  Brush widths are
+        # multiplied by this so they look the same physical size on the panel.
+        self.resolution = max(1, int(resolution))
         self.image = Image.new("RGB", (width, height), bg)
         self.lock = threading.RLock()
         self._draw = ImageDraw.Draw(self.image)
@@ -121,6 +162,8 @@ class Canvas:
         self._pen_size: float = 8.0
         self._eraser_size: float = 48.0
         self._pressure_sensitive: bool = True
+        # --fixed-pen-size flips this to False (constant on-screen width).
+        self._log_pen_scaling: bool = True
 
         # current brush (pen or eraser depending on last input event)
         self._is_eraser: bool = False
@@ -168,6 +211,27 @@ class Canvas:
         self.brush = (self._eraser_brush() if self._is_eraser
                       else self._pen_brush())
 
+    def set_log_pen_scaling(self, on: bool) -> bool:
+        """Enable/disable the logarithmic zoom term in the pen width.
+
+        Returns True when the setting actually changed (callers use that to
+        decide whether every page's canvas must be reconfigured).
+        """
+        on = bool(on)
+        if on == self._log_pen_scaling:
+            return False
+        self._log_pen_scaling = on
+        return True
+
+    @property
+    def log_pen_scaling(self) -> bool:
+        return self._log_pen_scaling
+
+    def pen_factor(self) -> float:
+        """Canvas-unit multiplier for the current zoom level."""
+        return pen_zoom_factor(self.viewport.scale, self.resolution,
+                               self._log_pen_scaling)
+
     @property
     def pen_color(self) -> Tuple[int, int, int]:
         return self._pen_color
@@ -214,7 +278,11 @@ class Canvas:
     def draw_segment(self, x0: float, y0: float, x1: float, y1: float,
                      pressure: float) -> None:
         b = self.brush
-        w = b.width_at(pressure)
+        # Brush widths are configured in panel pixels; convert them to canvas
+        # units with the zoom/resolution factor (see pen_zoom_factor).  The
+        # factor uses the zoom level *at draw time*, so strokes drawn before a
+        # zoom keep their original canvas width (WYSIWYG).
+        w = b.width_at(pressure) * self.pen_factor()
         r = w / 2.0
         with self.lock:
             self._draw.line([(x0, y0), (x1, y1)], fill=b.color,
@@ -229,7 +297,7 @@ class Canvas:
 
     def draw_dot(self, x: float, y: float, pressure: float) -> None:
         b = self.brush
-        w = b.width_at(pressure)
+        w = b.width_at(pressure) * self.pen_factor()
         r = w / 2.0
         with self.lock:
             self._draw.ellipse([x - r, y - r, x + r, y + r], fill=b.color)

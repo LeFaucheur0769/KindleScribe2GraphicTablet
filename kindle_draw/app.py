@@ -87,6 +87,14 @@ def parse_args(argv=None) -> argparse.Namespace:
     # Canvas
     p.add_argument("--canvas-width", type=int, default=None)
     p.add_argument("--canvas-height", type=int, default=None)
+    p.add_argument("--canvas-resolution", type=int, choices=[1, 2, 3, 4],
+                   default=4,
+                   help="Canvas size relative to the panel: 1 = panel-sized, "
+                        "4 = four times wider and taller (default 4).  Higher "
+                        "values make zoomed-in drawing sharper (up to 1:1 "
+                        "pixel detail at max zoom) and raise the pinch zoom "
+                        "ceiling to match.  Memory use grows with the square "
+                        "of this value.")
 
     # Stylus
     p.add_argument("--stylus-dev", default=None,
@@ -117,8 +125,12 @@ def parse_args(argv=None) -> argparse.Namespace:
                         "either 'MAX' (min assumed 0) or 'XMIN XMAX YMIN YMAX'. "
                         "Gives an exact finger-to-canvas mapping; without it "
                         "the tracker estimates the range from observed events")
-    g.add_argument("--max-zoom", type=float, default=8.0,
-                   help="Maximum pinch zoom factor (default 8.0)")
+    g.add_argument("--max-zoom", type=float, default=None,
+                   help="Maximum pinch zoom factor.  Default: the canvas "
+                        "resolution factor (so the deepest zoom shows the "
+                        "canvas 1:1 and stays sharp).  You may override it, "
+                        "but zooming past the canvas resolution only upscales "
+                        "blurry pixels.")
 
     # Pen
     g = p.add_argument_group("Pen")
@@ -133,6 +145,11 @@ def parse_args(argv=None) -> argparse.Namespace:
     g.add_argument("--no-pressure", dest="pressure_sensitive",
                    action="store_false", default=None,
                    help="Disable pressure sensitivity")
+    g.add_argument("--fixed-pen-size", action="store_true", default=False,
+                   help="Keep the pen the same on-screen size at every zoom "
+                        "level.  By default the on-screen width grows "
+                        "logarithmically with zoom (size * (1 + ln zoom)), "
+                        "which stays visually appealing while zooming in.")
 
     # Injection
     p.add_argument("--inject",
@@ -703,8 +720,20 @@ def _resolve_inject_rotation(raw: str, is_system_inject: bool) -> int:
 # --------------------------------------------------------------------------- #
 
 def build_config(args: argparse.Namespace) -> AppConfig:
-    canvas_w = args.canvas_width or args.width
-    canvas_h = args.canvas_height or args.height
+    # Canvas sizing: the resolution factor N makes the canvas N times wider
+    # and taller than the panel (N=4 -> 7440x9920 on a 1860x2480 panel).
+    # Explicit --canvas-width/--canvas-height take precedence; the resolution
+    # factor is then *derived* from them so pen scaling and the default zoom
+    # ceiling stay consistent with the actual canvas size.
+    resolution = max(1, int(args.canvas_resolution))
+    if args.canvas_width or args.canvas_height:
+        canvas_w = args.canvas_width or args.width
+        canvas_h = args.canvas_height or args.height
+        resolution = max(1, round(canvas_w / args.width),
+                         round(canvas_h / args.height))
+    else:
+        canvas_w = args.width * resolution
+        canvas_h = args.height * resolution
     kd = KindleConfig()
 
     # --- pen --------------------------------------------------------- #
@@ -724,15 +753,37 @@ def build_config(args: argparse.Namespace) -> AppConfig:
         pen.eraser_size = float(args.eraser_size)
     if getattr(args, "pressure_sensitive", None) is not None:
         pen.pressure_sensitive = bool(args.pressure_sensitive)
+    pen.fixed_pen_size = bool(args.fixed_pen_size)
 
     # --- touch (pinch-zoom / pan) ------------------------------------- #
     touch = TouchConfig()
     touch.enabled = bool(args.pinch)
     touch.dev = args.touch_dev
     touch.pan = bool(args.touch_pan)
-    touch.max_scale = float(args.max_zoom)
-    if touch.max_scale <= 1.0:
-        raise ValueError(f"--max-zoom must be > 1, got {args.max_zoom}")
+    # Zoom ceiling: default to the canvas resolution factor so the deepest
+    # zoom shows the canvas 1:1 (every canvas pixel maps to one panel pixel)
+    # and stays sharp.  Zooming past that only upscales blurry pixels.
+    if args.max_zoom is not None:
+        touch.max_scale = float(args.max_zoom)
+        if touch.max_scale <= 1.0:
+            raise ValueError(f"--max-zoom must be > 1, got {args.max_zoom}")
+        if touch.max_scale > resolution:
+            log.warning(
+                "--max-zoom %.2fx exceeds the canvas resolution factor %dx: "
+                "zooming past %dx only upscales blurry pixels (canvas is "
+                "%dx%d, panel %dx%d).",
+                touch.max_scale, resolution, resolution,
+                canvas_w, canvas_h, args.width, args.height,
+            )
+    else:
+        touch.max_scale = float(resolution)
+        if resolution == 1:
+            log.warning(
+                "canvas is panel-sized (resolution 1): the default zoom "
+                "ceiling is 1.0, so pinch-zoom cannot go deeper. Pass "
+                "--max-zoom > 1 to allow zooming (pixels will be upscaled) "
+                "or --canvas-resolution 2/3/4 for a sharper zoom."
+            )
     if args.touch_range is not None:
         vals = list(args.touch_range)
         if len(vals) == 1:
@@ -834,6 +885,7 @@ def build_config(args: argparse.Namespace) -> AppConfig:
         ),
         canvas_width=canvas_w,
         canvas_height=canvas_h,
+        canvas_resolution=resolution,
         calibrate=args.calibrate,
         no_input=args.no_input,
         freeze_ui=args.freeze_ui,
@@ -993,7 +1045,8 @@ def main(argv=None) -> int:
 
     # --- components --------------------------------------------------- #
     pages = PageManager(cfg.canvas_width, cfg.canvas_height,
-                        max_scale=cfg.touch.max_scale)
+                        max_scale=cfg.touch.max_scale,
+                        resolution=cfg.canvas_resolution)
     stop_event = threading.Event()
 
     canvas = pages.current()
@@ -1001,9 +1054,12 @@ def main(argv=None) -> int:
     canvas.set_pen_size(cfg.pen.size)
     canvas.set_eraser_size(cfg.pen.eraser_size)
     canvas.set_pressure_sensitive(cfg.pen.pressure_sensitive)
-    log.info("pen: color=%s size=%.1f eraser=%.1f pressure=%s",
+    canvas.set_log_pen_scaling(not cfg.pen.fixed_pen_size)
+    log.info("pen: color=%s size=%.1f eraser=%.1f pressure=%s "
+             "zoom scaling=%s",
              cfg.pen.color, cfg.pen.size, cfg.pen.eraser_size,
-             cfg.pen.pressure_sensitive)
+             cfg.pen.pressure_sensitive,
+             "fixed" if cfg.pen.fixed_pen_size else "logarithmic")
 
     def _apply_pen_to_current():
         c = pages.current()
@@ -1011,6 +1067,8 @@ def main(argv=None) -> int:
         c.set_pen_size(cfg.pen.size)
         c.set_eraser_size(cfg.pen.eraser_size)
         c.set_pressure_sensitive(cfg.pen.pressure_sensitive)
+        # New pages get the same pen-zoom behaviour as the first one.
+        c.set_log_pen_scaling(not cfg.pen.fixed_pen_size)
 
     pages.add_listener(_apply_pen_to_current)
 

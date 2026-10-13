@@ -21,26 +21,30 @@ class PageManager:
         width: int,
         height: int,
         bg=(255, 255, 255),
-        max_scale: float = 8.0,
+        max_scale: float = 4.0,
+        resolution: int = 1,
     ) -> None:
         """Create a manager whose pages all share the canvas size and pinch
         zoom limits.
 
-        ``max_scale`` is forwarded to every :class:`Canvas` so each page gets
-        its own viewport with the same zoom ceiling (a fresh page always
-        starts at the identity viewport: scale 1, offset 0).
+        ``max_scale`` and ``resolution`` are forwarded to every
+        :class:`Canvas` so each page gets its own viewport with the same zoom
+        ceiling and the same panel-relative resolution (used for pen-width
+        scaling; see :func:`kindle_draw.canvas.pen_zoom_factor`).  A fresh
+        page always starts at the identity viewport: scale 1, offset 0.
         """
         self.width = width
         self.height = height
         self.bg = bg
         self.max_scale = max_scale
+        self.resolution = max(1, int(resolution))
         self.pages: List[Canvas] = [self._make_canvas()]
         self.idx = 0
         self._listeners: List[Callable[[], None]] = []
 
     def _make_canvas(self) -> Canvas:
         return Canvas(self.width, self.height, self.bg,
-                      max_scale=self.max_scale)
+                      max_scale=self.max_scale, resolution=self.resolution)
 
     # -- listener plumbing --------------------------------------------- #
 

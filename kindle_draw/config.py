@@ -51,15 +51,21 @@ class TouchConfig:
     dev: Optional[str] = None         # --touch-dev (None -> autodetect)
     pan: bool = False                 # --touch-pan: single-finger pan (opt-in)
     touch_range: Optional[Tuple[int, ...]] = None  # --touch-range: raw min,max pairs
-    max_scale: float = 8.0            # --max-zoom upper bound (> 1)
+    # Zoom ceiling.  None means "derive it from the canvas resolution" so the
+    # user can zoom until canvas pixels map 1:1 onto panel pixels (the sharpest
+    # possible view).  build_config always resolves this to a concrete float.
+    max_scale: Optional[float] = None  # --max-zoom (explicit value must be > 1)
 
 
 @dataclass
 class PenConfig:
     color: Tuple[int, int, int] = (0, 0, 0)
-    size: float = 8.0
+    size: float = 8.0                 # nominal width in panel pixels at 1:1 zoom
     eraser_size: float = 48.0
     pressure_sensitive: bool = True
+    # --fixed-pen-size: keep the on-screen pen width constant at every zoom
+    # level instead of growing it logarithmically (see canvas.pen_zoom_factor).
+    fixed_pen_size: bool = False
 
 
 @dataclass
@@ -104,6 +110,10 @@ class AppConfig:
 
     canvas_width: int = 1860
     canvas_height: int = 2480
+    # Drawing-buffer resolution as a multiple of the panel size (1..4).  The
+    # zoom ceiling defaults to this factor: at that zoom one canvas pixel maps
+    # to exactly one panel pixel, so the extra pixels buy sharpness, not blur.
+    canvas_resolution: int = 4
 
     calibrate: bool = False
     no_input: bool = False

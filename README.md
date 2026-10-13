@@ -85,7 +85,9 @@ kindle-draw            # or: python -m kindle_draw
 ```
 
 Opens the Qt launcher: fill in the Kindle's IP/credentials, pick a mode,
-launch. No arguments required.
+launch. No arguments required. The launcher also exposes the canvas
+resolution (`1x`–`4x`), the zoom ceiling, and the pen-size scaling
+option, and remembers them between runs.
 
 ### CLI
 
@@ -125,7 +127,9 @@ flag. Password auth works via `--password` or `$KINDLE_SSH_PASSWORD`
 | `--pinch` | Enable two-finger pinch-zoom/pan on the canvas (canvas mode) |
 | `--touch-pan` | Also pan with a *single* finger (default: two fingers only) |
 | `--touch-dev PATH` / `--touch-range ...` | Touchscreen device / raw-axis overrides for `--pinch` |
-| `--max-zoom F` | Zoom ceiling for `--pinch` (default 8×) |
+| `--canvas-resolution N` | Canvas size multiplier `1`–`4` (default `4`): canvas = panel × N, and the zoom ceiling follows N |
+| `--max-zoom F` | Zoom ceiling override for `--pinch` (default: auto = the canvas resolution) |
+| `--fixed-pen-size` | Keep pen/eraser width constant *on screen* at every zoom level (disables the default logarithmic size scaling) |
 | `--gui` | Also open a host-side Tkinter window mirroring the canvas |
 | `--freeze-ui` | SIGSTOP the Kindle window manager while running |
 | `-v`, `-vv` | More logging |
@@ -158,17 +162,41 @@ set it with `--touch-dev /dev/input/eventN`) and turns raw
 ```bash
 kindle-draw --pinch                 # pinch-zoom + two-finger pan
 kindle-draw --pinch --touch-pan     # also single-finger pan
-kindle-draw --pinch --max-zoom 4    # cap zoom at 4x (default 8x)
+kindle-draw --pinch --canvas-resolution 2   # smaller canvas, zoom capped at 2x
+kindle-draw --pinch --max-zoom 3    # override the automatic zoom ceiling
 ```
 
 Each page keeps its own viewport; zooming never changes the canvas
 itself, only which window of it is streamed to the panel.
 
-**Drawing while zoomed.** The stylus draws to the canvas point that is
-visible under its tip (what you see is what you get). Brush and eraser
-widths stay in canvas units, so a stroke looks `zoom`-times thicker on
-the panel while zoomed in — fine for detail work, just be aware of it
-before saving.
+### Canvas resolution and zoom limits
+
+The canvas is **panel × N**, where `N` is `--canvas-resolution`
+(`1`–`4`, default `4`). On a Scribe panel (1860×2480) the default gives
+a 7440×9920 canvas — about 221 MB of RGB pixel data, so drop to `2` or
+`1` on a memory-tight host (memory grows as N²).
+
+The zoom ceiling is **automatic: it equals N**. At the ceiling the
+visible window is exactly panel-sized, so every canvas pixel maps 1:1
+to a panel pixel — zooming in never gets blurry, it just reveals more
+detail. At scale 1 the whole canvas is downscaled to fit the panel.
+Zooming past N (possible only with an explicit `--max-zoom`) upscales
+the preview, so the app warns you when the override exceeds the
+resolution. `kill -USR2` (below) always brings you back to the sharp
+1:1 baseline.
+
+**Drawing while zoomed (logarithmic pen size).** The stylus draws to
+the canvas point visible under its tip (what you see is what you get).
+Pen and eraser sizes are defined in panel pixels; while zoomed, the
+stroke's *on-screen* width grows only logarithmically —
+`size × (1 + ln zoom)` — instead of ballooning linearly. At 4× zoom an
+8 px pen appears roughly 19 px wide on the panel (a linear scale would
+give 32 px): still comfortable to draw with, while the stroke is
+recorded at full canvas resolution and stays crisp when you zoom in on
+it later. Pass `--fixed-pen-size` to keep the on-screen width exactly
+constant at every zoom level instead. Strokes drawn *before* zooming
+keep the width they were drawn with; only new strokes adapt to the
+current zoom.
 
 **Resetting the view.** Send `SIGUSR2` to the process to snap the
 current page back to 1:1:

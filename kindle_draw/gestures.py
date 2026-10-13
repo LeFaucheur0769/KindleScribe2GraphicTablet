@@ -155,7 +155,7 @@ class Viewport:
     """
 
     def __init__(self, canvas_w: int, canvas_h: int,
-                 min_scale: float = 1.0, max_scale: float = 8.0) -> None:
+                 min_scale: float = 1.0, max_scale: float = 4.0) -> None:
         self.canvas_w = float(canvas_w)
         self.canvas_h = float(canvas_h)
         self.min_scale = float(min_scale)

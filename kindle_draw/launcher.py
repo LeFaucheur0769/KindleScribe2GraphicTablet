@@ -482,6 +482,15 @@ class Launcher(QMainWindow):
         self._pressure.setChecked(True)
         form.addRow("", self._pressure)
 
+        self._pen_zoom = QCheckBox("Scale pen size with zoom (log)")
+        self._pen_zoom.setChecked(True)
+        self._pen_zoom.setToolTip(
+            "Keep the pen visually useful while zoomed in: its on-screen\n"
+            "width grows with 1 + ln(zoom) instead of shrinking with the\n"
+            "view. Uncheck for a constant on-screen pen size\n"
+            "(--fixed-pen-size).")
+        form.addRow("", self._pen_zoom)
+
         return box
 
     def _build_mode_box(self) -> QGroupBox:
@@ -626,12 +635,25 @@ class Launcher(QMainWindow):
             "single touches do not move the view.")
         form.addRow("", self._touch_pan)
 
+        self._canvas_res = QComboBox()
+        self._canvas_res.addItems(["1x", "2x", "3x", "4x"])
+        self._canvas_res.setCurrentIndex(3)  # 4x: canvas = 4x the panel
+        self._canvas_res.setToolTip(
+            "Canvas resolution vs. the screen (--canvas-resolution).\n"
+            "4x means a 7440x9920 canvas: zooming to 4x shows it 1:1, so\n"
+            "strokes stay sharp at max zoom. ~221 MB RAM at 4x.\n"
+            "The zoom limit follows this factor automatically.")
+        self._canvas_res.currentIndexChanged.connect(self._on_resolution_changed)
+        form.addRow("Canvas resolution", self._canvas_res)
+
         self._max_zoom = QDoubleSpinBox()
         self._max_zoom.setRange(1.5, 20.0)
         self._max_zoom.setSingleStep(0.5)
-        self._max_zoom.setValue(8.0)
+        self._max_zoom.setValue(4.0)  # auto-synced to the resolution factor
         self._max_zoom.setSuffix("x")
-        self._max_zoom.setToolTip("Maximum zoom factor (--max-zoom).")
+        self._max_zoom.setToolTip(
+            "Maximum zoom factor (--max-zoom). Kept in sync with the\n"
+            "canvas resolution above; change it afterwards to override.")
         form.addRow("Max zoom", self._max_zoom)
 
         self._touch_dev = QLineEdit()
@@ -721,6 +743,19 @@ class Launcher(QMainWindow):
                        self._touch_dev, self._touch_range):
             widget.setEnabled(on)
 
+    def _on_resolution_changed(self, index: int) -> None:
+        """Mirror the CLI's resolution-linked zoom default into the spinbox.
+
+        The CLI defaults the zoom ceiling to the canvas resolution factor
+        (1:1 sharp pixels at max zoom). The launcher reproduces that by
+        pushing the new resolution into the max-zoom spinbox; the user can
+        still change the spinbox afterwards to override it. The resolution
+        combo itself is never gated by the pinch checkbox: it sizes the
+        canvas in every mode, so higher resolution also means sharper
+        exported pages even without zooming.
+        """
+        self._max_zoom.setValue(float(index + 1))
+
     # ------------------------------------------------------------------ #
     # Config I/O                                                         #
     # ------------------------------------------------------------------ #
@@ -740,6 +775,7 @@ class Launcher(QMainWindow):
             "pen_size": self._pen_size.value(),
             "eraser_size": self._eraser_size.value(),
             "pressure_sensitive": self._pressure.isChecked(),
+            "fixed_pen_size": not self._pen_zoom.isChecked(),
             "open_gui": self._open_gui.isChecked(),
             "cursor": self._cursor.currentText(),
             "freeze_ui": self._freeze_ui.isChecked(),
@@ -756,6 +792,7 @@ class Launcher(QMainWindow):
             "verbose": self._verbose.isChecked(),
             "pinch": self._pinch.isChecked(),
             "touch_pan": self._touch_pan.isChecked(),
+            "canvas_resolution": self._canvas_res.currentIndex() + 1,
             "max_zoom": self._max_zoom.value(),
             "touch_dev": self._touch_dev.text().strip(),
             "touch_range": self._touch_range.text().strip(),
@@ -798,6 +835,8 @@ class Launcher(QMainWindow):
         self._pen_size.setValue(float(cfg.get("pen_size", 8.0)))
         self._eraser_size.setValue(float(cfg.get("eraser_size", 48.0)))
         b("pressure_sensitive", self._pressure, True)
+        # fixed_pen_size=True means the log pen-scaling checkbox is off.
+        self._pen_zoom.setChecked(not bool(cfg.get("fixed_pen_size", False)))
 
         b("open_gui", self._open_gui, True)
         b("no_letterbox", self._no_letterbox)
@@ -831,9 +870,18 @@ class Launcher(QMainWindow):
 
         # Touch controls (absent from configs saved before pinch zoom
         # existed) fall back to the CLI defaults.
+        #
+        # The resolution combo is restored first: its change handler syncs
+        # the max-zoom spinbox to the resolution factor, and a saved
+        # max_zoom override is then applied on top of that.
+        try:
+            resolution = int(cfg.get("canvas_resolution", 4))
+        except (TypeError, ValueError):
+            resolution = 4
+        self._canvas_res.setCurrentIndex(min(max(resolution, 1), 4) - 1)
         b("pinch", self._pinch)
         b("touch_pan", self._touch_pan)
-        self._max_zoom.setValue(float(cfg.get("max_zoom", 8.0)))
+        self._max_zoom.setValue(float(cfg.get("max_zoom", 4.0)))
         self._touch_dev.setText(str(cfg.get("touch_dev", "") or ""))
         self._touch_range.setText(str(cfg.get("touch_range", "") or ""))
 
@@ -909,6 +957,11 @@ class Launcher(QMainWindow):
         args += ["--eraser-size", str(cfg["eraser_size"])]
         if not cfg["pressure_sensitive"]:
             args += ["--no-pressure"]
+        if cfg.get("fixed_pen_size"):
+            args += ["--fixed-pen-size"]
+        # Canvas resolution sizes the drawing surface in every mode (and
+        # sets the zoom ceiling), so it is always passed explicitly.
+        args += ["--canvas-resolution", str(cfg.get("canvas_resolution", 4))]
         if cfg["cursor"] != "off":
             args += ["--cursor", cfg["cursor"]]
         if cfg["freeze_ui"]:
