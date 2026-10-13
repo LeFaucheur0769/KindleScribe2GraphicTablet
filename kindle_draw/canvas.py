@@ -171,6 +171,9 @@ class Canvas:
 
         self._dirty: Optional[Box] = None
         self.version: int = 0
+        # Signature of the viewport the last full preview was rendered for.
+        # A change means the whole panel must be re-rendered and diffed.
+        self._vp_sig: Optional[Tuple[float, float, float]] = None
 
     # -- brush construction --------------------------------------------- #
 
@@ -268,6 +271,29 @@ class Canvas:
             d = self._dirty
             self._dirty = None
             return d
+
+    def take_update(self) -> Tuple[int, Optional[Box], bool, Box]:
+        """Atomically consume one canvas update for the streamer.
+
+        Returns ``(version, dirty, viewport_changed, window)``:
+
+        * ``version`` - version counter at the moment of consumption
+        * ``dirty`` - dirty box in canvas pixels, or ``None`` (consumed)
+        * ``viewport_changed`` - True when the visible window moved since the
+          last call, so the streamer must re-render the full panel and diff
+        * ``window`` - the visible window as integer canvas pixels, captured
+          under the same lock as the dirty box so the two always agree
+        """
+        with self.lock:
+            version = self.version
+            dirty = self._dirty
+            self._dirty = None
+            window = self.viewport.viewport_box()
+            sig = (self.viewport.scale, self.viewport.offset_x,
+                   self.viewport.offset_y)
+            changed = sig != self._vp_sig
+            self._vp_sig = sig
+            return version, dirty, changed, window
 
     # -- drawing -------------------------------------------------------- #
 
@@ -400,6 +426,62 @@ class Canvas:
         with self.lock:
             return self.viewport.viewport_box()
 
+    def render_region(self, pw: int, ph: int, mode: str, box: Box,
+                      window: Optional[Box] = None,
+                      resample=BILINEAR) -> Optional[Image.Image]:
+        """Render only a sub-rectangle of the panel preview.
+
+        ``box`` is a panel-pixel rectangle ``(x0, y0, x1, y1)`` within the
+        ``pw x ph`` preview.  The pixels returned are identical (up to
+        sub-pixel resampling rounding) to what :meth:`render_preview` would
+        produce for that region, but only the corresponding canvas crop is
+        resampled -- a fraction of the cost when the canvas is large.
+
+        ``window`` is the visible canvas window used to map panel pixels to
+        canvas pixels; pass the box returned by :meth:`take_update` so the
+        region lines up exactly with the frame the streamer last rendered.
+        When omitted the current viewport window is used.
+
+        Returns ``None`` when the region cannot be mapped one-to-one (empty
+        crop, or an aspect mismatch that ``mode`` would resolve with
+        letterboxing/cropping); callers should fall back to a full
+        :meth:`render_preview`.
+        """
+        with self.lock:
+            img = self.image
+            iw, ih = img.size
+            if window is None:
+                window = (self.viewport.viewport_box()
+                          if not self.viewport.is_identity()
+                          else (0, 0, iw, ih))
+            wx0, wy0, wx1, wy1 = window
+            ww, wh = wx1 - wx0, wy1 - wy0
+            if ww <= 0 or wh <= 0 or pw <= 0 or ph <= 0:
+                return None
+            if mode != "stretch" and abs(ww * ph - wh * pw) > 1e-3 * max(
+                    ww * ph, wh * pw, 1):
+                return None  # fit/crop would letterbox: region mapping invalid
+
+            bx0 = max(0, min(pw, box[0]))
+            by0 = max(0, min(ph, box[1]))
+            bx1 = max(0, min(pw, box[2]))
+            by1 = max(0, min(ph, box[3]))
+            if bx1 <= bx0 or by1 <= by0:
+                return None
+
+            # Panel box -> canvas crop through the same window the full
+            # preview render used, clamped to the image bounds.
+            cx0 = min(iw, max(0, wx0 + bx0 * ww / pw))
+            cy0 = min(ih, max(0, wy0 + by0 * wh / ph))
+            cx1 = min(iw, max(0, wx0 + bx1 * ww / pw))
+            cy1 = min(ih, max(0, wy0 + by1 * wh / ph))
+            if cx1 <= cx0 or cy1 <= cy0:
+                return None
+
+            return img.resize((bx1 - bx0, by1 - by0), resample,
+                              box=(cx0, cy0, cx1, cy1),
+                              reducing_gap=2.0).convert("L")
+
     # -- I/O ------------------------------------------------------------ #
 
     def save_png(self, path: str) -> None:
@@ -412,7 +494,8 @@ class Canvas:
 
     # -- preview -------------------------------------------------------- #
 
-    def render_preview(self, pw: int, ph: int, mode: str = "fit") -> Image.Image:
+    def render_preview(self, pw: int, ph: int, mode: str = "fit",
+                       resample=BILINEAR) -> Image.Image:
         """Render the visible viewport window as a panel-sized grayscale image.
 
         With an identity viewport this is the whole canvas scaled to the panel
@@ -427,12 +510,24 @@ class Canvas:
         with self.lock:
             img = self.image
             if not self.viewport.is_identity():
-                img = img.crop(self.viewport.viewport_box())
-            if (pw, ph) == img.size and mode == "fit":
-                return img.convert("L")             # was: .copy()
-            iw, ih = img.size
-            if mode == "stretch":
-                return img.resize((pw, ph), BILINEAR).convert("L")
+                window = self.viewport.viewport_box()
+            else:
+                window = (0, 0, img.width, img.height)
+            if (pw, ph) == (window[2] - window[0], window[3] - window[1]) \
+                    and mode == "fit":
+                return img.resize((pw, ph), resample, box=window,
+                                  reducing_gap=2.0).convert("L")
+            iw, ih = window[2] - window[0], window[3] - window[1]
+            if mode == "stretch" or abs(iw * ph - ih * pw) <= 1e-3 * max(
+                    iw * ph, ih * pw, 1):
+                # Single-pass crop+scale: avoids copying the (potentially
+                # hundreds of MB) window and lets Pillow average the image
+                # down with its fast C ``Image.reduce`` path before the final
+                # resample, which is dramatically cheaper than BILINEAR over
+                # the full window at high canvas resolutions.
+                return img.resize((pw, ph), resample, box=window,
+                                  reducing_gap=2.0).convert("L")
+            img = img.crop(window)
             if mode == "crop":
                 s = max(pw / iw, ph / ih)
                 nw, nh = int(round(iw * s)), int(round(ih * s))

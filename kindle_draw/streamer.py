@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import io
 import logging
+import math
 import threading
 import time
 from typing import Callable, Optional, Tuple
@@ -64,6 +65,27 @@ def clamp_box(box: Box, w: int, h: int) -> Optional[Box]:
     if x1 <= x0 or y1 <= y0:
         return None
     return (x0, y0, x1, y1)
+
+
+def _canvas_box_to_panel(box: Box, window: Box, pw: int,
+                         ph: int) -> Optional[Box]:
+    """Map a canvas-space rectangle through the visible window to panel
+    pixels.  Returns None when the rectangle lies entirely outside the
+    window (i.e. nothing visible on the panel changed)."""
+    wx0, wy0, wx1, wy1 = window
+    x0 = max(box[0], wx0)
+    y0 = max(box[1], wy0)
+    x1 = min(box[2], wx1)
+    y1 = min(box[3], wy1)
+    if x1 <= x0 or y1 <= y0:
+        return None
+    ww = max(1, wx1 - wx0)
+    wh = max(1, wy1 - wy0)
+    px0 = int((x0 - wx0) * pw / ww)
+    py0 = int((y0 - wy0) * ph / wh)
+    px1 = math.ceil((x1 - wx0) * pw / ww)
+    py1 = math.ceil((y1 - wy0) * ph / wh)
+    return (px0, py0, px1, py1)
 
 
 def _diff_bbox(diff: Image.Image, threshold: int) -> Optional[Box]:
@@ -363,10 +385,70 @@ class Streamer(threading.Thread):
                 self._send_clean_canvas(self._last, self._cursor_drawn)
                 self._clean_pending = False
             return
+
+        # Consume the canvas update atomically: the dirty rectangle and the
+        # visible window come from the same locked snapshot, so the region
+        # path below maps exactly onto what the preview cache shows.
+        prev_version = self._last_version
+        take = getattr(canvas, "take_update", None)
+        if take is not None:
+            v, dirty_canvas, viewport_changed, window = take()
+        else:  # duck-typed canvas without dirty tracking
+            v, dirty_canvas, viewport_changed, window = (
+                getattr(canvas, "version", 0), None, True, None)
+
+        pw, ph = self._panel_w, self._panel_h
+        cursor_only = (dirty_canvas is None
+                       and v == prev_version
+                       and cursor_changed)
         self._last_version = v
 
-        preview = canvas.render_preview(self._panel_w, self._panel_h,
-                                        self._aspect)
+        # Fast path: the visible window has not moved and we know which part
+        # of the (possibly 4x-resolution) canvas changed, so resample and
+        # push only that panel region instead of the whole canvas.
+        if (self._last is not None
+                and self._last.size == (pw, ph)
+                and not viewport_changed
+                and window is not None
+                and (dirty_canvas is not None or cursor_only)):
+            box: Optional[Box] = None
+            if dirty_canvas is not None:
+                box = _canvas_box_to_panel(dirty_canvas, window, pw, ph)
+                if box is not None:
+                    # Resampling bleeds a pixel or two past the mapped dirty
+                    # rectangle; pad a little and snap to the refresh grid.
+                    box = (box[0] - 2, box[1] - 2, box[2] + 2, box[3] + 2)
+            if cursor_changed:
+                if self._cursor_drawn is not None:
+                    box = union(box, _cursor_bbox(*self._cursor_drawn))
+                if cursor_preview is not None:
+                    box = union(box, _cursor_bbox(*cursor_preview))
+            if box is None:
+                # Drawing entirely outside the visible window (or a cursor
+                # parked off-panel): nothing visible on the panel changed.
+                self._cursor_drawn = cursor_preview
+                return
+            box = clamp_box(snap_box(box, self.cfg.align, pw, ph), pw, ph)
+            if box is not None:
+                region = canvas.render_region(pw, ph, self._aspect, box,
+                                              window=window)
+                if region is not None:
+                    push = region
+                    if cursor_preview is not None:
+                        push = region.copy()
+                        _draw_cursor(push, cursor_preview[0] - box[0],
+                                     cursor_preview[1] - box[1])
+                    self._send_region_image(push, box, wf=self.cfg.active_wf)
+                    self._last.paste(region, (box[0], box[1]))
+                    self._cursor_drawn = cursor_preview
+                    self._dirty_union = union(self._dirty_union, box)
+                    self._clean_pending = True
+                    self._last_activity = time.time()
+                    return
+            # Region render rejected (aspect gate) or degenerate box: fall
+            # through to the full render + diff path.
+
+        preview = canvas.render_preview(pw, ph, self._aspect)
 
         if self._last is None or self._last.size != preview.size:
             self._send_full_canvas(preview, cursor_preview)
@@ -436,6 +518,16 @@ class Streamer(threading.Thread):
         crop.save(buf, "PNG", compress_level=1)
         x0, y0, _x1, _y1 = bbox
         log.debug("streamer: partial refresh %s wf=%s", bbox, wf)
+        self.kindle.draw_png(
+            buf.getvalue(), x=x0, y=y0, wf=wf,
+        )
+
+    def _send_region_image(self, img: Image.Image, bbox: Box, wf: str) -> None:
+        """Push a freshly rendered region image at its panel position."""
+        buf = io.BytesIO()
+        img.save(buf, "PNG", compress_level=1)
+        x0, y0, _x1, _y1 = bbox
+        log.debug("streamer: region refresh %s wf=%s", bbox, wf)
         self.kindle.draw_png(
             buf.getvalue(), x=x0, y=y0, wf=wf,
         )

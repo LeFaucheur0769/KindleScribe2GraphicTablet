@@ -353,7 +353,12 @@ class CanvasView(QGraphicsView):
 
         target_w = max(1, int(canvas.width * scale))
         target_h = max(1, int(canvas.height * scale))
-        img = canvas.snapshot().resize((target_w, target_h), Image.LANCZOS)
+        # Resize straight from the canvas image under its lock: skips the
+        # full-canvas snapshot copy (hundreds of MB at high resolution) and
+        # lets Pillow pre-filter with its fast integer box-reduce path.
+        with canvas.lock:
+            img = canvas.image.resize((target_w, target_h), Image.LANCZOS,
+                                      reducing_gap=2.0)
         pm = _pil_to_pixmap(img)
         self._pixitem.setPixmap(pm)
         self._scene.setSceneRect(0, 0, pm.width(), pm.height())
