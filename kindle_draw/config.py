@@ -55,6 +55,10 @@ class TouchConfig:
     # user can zoom until canvas pixels map 1:1 onto panel pixels (the sharpest
     # possible view).  build_config always resolves this to a concrete float.
     max_scale: Optional[float] = None  # --max-zoom (explicit value must be > 1)
+    # Minimum two-finger distance, in raw touch-device units, before a
+    # two-finger frame counts as a gesture at all (--min-spread).  Raise it
+    # if close-together fingers trigger pinch/pan by accident.
+    min_spread: float = 60.0
 
 
 @dataclass

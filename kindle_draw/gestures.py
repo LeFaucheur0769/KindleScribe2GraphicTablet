@@ -333,8 +333,15 @@ class PinchTracker:
         False: the Scribe stylus can generate stray single-contact MT events,
         so panning defaults to two-finger drags folded into the pinch event.
     min_spread:
-        Minimum raw finger spread (device units) before a pinch zoom is
-        computed; below it the factor stays 1.0 (noise gate).
+        Minimum raw finger spread (device units) for a two-finger frame to
+        count as a gesture at all: frames below it are ignored entirely.
+        The baseline pair still tracks them, so crossing the threshold
+        starts the gesture smoothly, and the zoom factor additionally
+        requires *both* the previous and current spread to clear it, so
+        noise near the threshold cannot produce a wild ratio.  Default
+        60.0 raw units: above the jitter of two fingers resting close
+        together, well below a deliberate pinch (typically 200-600 units
+        on a 1860-wide panel).
     max_step:
         Clamp each per-event zoom factor into ``[1/max_step, max_step]`` so a
         noisy single event cannot teleport the scale.
@@ -344,7 +351,7 @@ class PinchTracker:
                  rotation: int = 0,
                  touch_range: Optional[Sequence[int]] = None,
                  enable_pan: bool = False,
-                 min_spread: float = 15.0,
+                 min_spread: float = 60.0,
                  max_step: float = 1.5) -> None:
         self.canvas_w = float(canvas_w)
         self.canvas_h = float(canvas_h)
@@ -549,9 +556,18 @@ class PinchTracker:
         if prev is None:
             return None  # baseline just established: no jump on contact start
 
+        # Fingers closer than min_spread: the whole two-finger frame is
+        # ignored (no zoom, no two-finger pan).  The baseline above still
+        # tracks the pair, so opening past the threshold starts the gesture
+        # from the current positions without a jump.
+        if spread < self.min_spread:
+            return None
+
         # Zoom factor from the spread ratio, gated against noise and clamped.
+        # Both sides must clear min_spread: a ratio measured from a spread
+        # that sat below the gate is unreliable (tiny denominators).
         factor = 1.0
-        if prev[2] >= self.min_spread and spread >= self.min_spread:
+        if prev[2] >= self.min_spread:
             factor = spread / prev[2]
         factor = min(max(factor, 1.0 / self.max_step), self.max_step)
 

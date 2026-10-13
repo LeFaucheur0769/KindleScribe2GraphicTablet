@@ -656,6 +656,17 @@ class Launcher(QMainWindow):
             "canvas resolution above; change it afterwards to override.")
         form.addRow("Max zoom", self._max_zoom)
 
+        self._min_spread = QDoubleSpinBox()
+        self._min_spread.setRange(0.0, 1000.0)
+        self._min_spread.setSingleStep(10.0)
+        self._min_spread.setValue(60.0)
+        self._min_spread.setToolTip(
+            "Minimum distance between the two fingers (--min-spread),\n"
+            "in raw touch-device units, before a two-finger gesture is\n"
+            "recognised at all.  Raise it if close-together fingers\n"
+            "trigger pinch/pan by accident; lower it for a tighter pinch.")
+        form.addRow("Min finger distance", self._min_spread)
+
         self._touch_dev = QLineEdit()
         self._touch_dev.setPlaceholderText("auto — e.g. /dev/input/event2")
         self._touch_dev.setToolTip(
@@ -739,7 +750,7 @@ class Launcher(QMainWindow):
 
     def _on_pinch_toggled(self, on: bool) -> None:
         """Gate the pinch sub-options behind the main --pinch checkbox."""
-        for widget in (self._touch_pan, self._max_zoom,
+        for widget in (self._touch_pan, self._max_zoom, self._min_spread,
                        self._touch_dev, self._touch_range):
             widget.setEnabled(on)
 
@@ -794,6 +805,7 @@ class Launcher(QMainWindow):
             "touch_pan": self._touch_pan.isChecked(),
             "canvas_resolution": self._canvas_res.currentIndex() + 1,
             "max_zoom": self._max_zoom.value(),
+            "min_spread": self._min_spread.value(),
             "touch_dev": self._touch_dev.text().strip(),
             "touch_range": self._touch_range.text().strip(),
         }
@@ -882,6 +894,7 @@ class Launcher(QMainWindow):
         b("pinch", self._pinch)
         b("touch_pan", self._touch_pan)
         self._max_zoom.setValue(float(cfg.get("max_zoom", 4.0)))
+        self._min_spread.setValue(float(cfg.get("min_spread", 60.0)))
         self._touch_dev.setText(str(cfg.get("touch_dev", "") or ""))
         self._touch_range.setText(str(cfg.get("touch_range", "") or ""))
 
@@ -992,6 +1005,7 @@ class Launcher(QMainWindow):
             if cfg["touch_pan"]:
                 args += ["--touch-pan"]
             args += ["--max-zoom", str(cfg["max_zoom"])]
+            args += ["--min-spread", str(cfg["min_spread"])]
             if cfg["touch_dev"]:
                 args += ["--touch-dev", cfg["touch_dev"]]
             # The range field is free text: empty or "auto" means let the

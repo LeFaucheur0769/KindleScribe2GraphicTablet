@@ -131,6 +131,12 @@ def parse_args(argv=None) -> argparse.Namespace:
                         "canvas 1:1 and stays sharp).  You may override it, "
                         "but zooming past the canvas resolution only upscales "
                         "blurry pixels.")
+    g.add_argument("--min-spread", type=float, default=None,
+                   help="Minimum distance between the two fingers (raw "
+                        "touch-device units) before a two-finger gesture is "
+                        "recognised at all.  Raise it if close-together "
+                        "fingers trigger pinch/pan by accident; lower it for "
+                        "a tighter pinch.  Default 60.")
 
     # Pen
     g = p.add_argument_group("Pen")
@@ -760,6 +766,10 @@ def build_config(args: argparse.Namespace) -> AppConfig:
     touch.enabled = bool(args.pinch)
     touch.dev = args.touch_dev
     touch.pan = bool(args.touch_pan)
+    if args.min_spread is not None:
+        if args.min_spread < 0:
+            raise ValueError(f"--min-spread must be >= 0, got {args.min_spread}")
+        touch.min_spread = float(args.min_spread)
     # Zoom ceiling: default to the canvas resolution factor so the deepest
     # zoom shows the canvas 1:1 (every canvas pixel maps to one panel pixel)
     # and stays sharp.  Zooming past that only upscales blurry pixels.
@@ -1161,6 +1171,7 @@ def main(argv=None) -> int:
                 rotation=0,                      # canvas mode is portrait
                 touch_range=cfg.touch.touch_range,
                 enable_pan=cfg.touch.pan,
+                min_spread=cfg.touch.min_spread,
             )
             touch_reader = TouchReader(
                 kindle=kindle,
@@ -1172,8 +1183,9 @@ def main(argv=None) -> int:
                 tracker=tracker,
             )
             log.info("pinch-zoom: on (max %.1fx, two-finger pan %s, "
-                     "range=%s)", cfg.touch.max_scale,
+                     "min finger distance %.0f, range=%s)", cfg.touch.max_scale,
                      "on" if cfg.touch.pan else "off",
+                     cfg.touch.min_spread,
                      cfg.touch.touch_range or "auto")
 
     # --- Kindle housekeeping ------------------------------------------ #
