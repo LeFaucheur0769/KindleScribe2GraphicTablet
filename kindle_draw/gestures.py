@@ -105,11 +105,23 @@ EV_KEY = 1
 EV_ABS = 3
 
 ABS_MT_SLOT        = 0x2f  # 47
+ABS_MT_TOUCH_MAJOR = 0x30  # 48
+ABS_MT_TOUCH_MINOR = 0x31  # 49
+ABS_MT_WIDTH_MAJOR = 0x32  # 50
+ABS_MT_WIDTH_MINOR = 0x33  # 51
 ABS_MT_ORIENTATION = 0x34  # 52
 ABS_MT_POSITION_X  = 0x35  # 53
 ABS_MT_POSITION_Y  = 0x36  # 54
 ABS_MT_TOOL_TYPE   = 0x37  # 55
 ABS_MT_TRACKING_ID = 0x39  # 57
+
+# Contact-size axes (linux/input-event-codes.h).  TOUCH_MAJOR/MINOR describe
+# the ellipse of the touch itself, WIDTH_MAJOR/MINOR the diameter of the
+# finger's touch area; drivers fill in different subsets of the four.  The
+# largest reported major dimension is used as the "contact size" for the
+# palm-resting gate (see PinchTracker.max_finger_size).
+_MT_SIZE_CODES = frozenset({ABS_MT_TOUCH_MAJOR, ABS_MT_TOUCH_MINOR,
+                            ABS_MT_WIDTH_MAJOR, ABS_MT_WIDTH_MINOR})
 
 # ``ABS_MT_TOOL_TYPE`` values (linux/input-event-codes.h).  On a hybrid panel
 # such as the Scribe the stylus can be reported through the *same* multi-touch
@@ -133,6 +145,19 @@ def _is_touch_tool(tool: Optional[int]) -> bool:
     a contact we cannot classify is more likely a finger than a pen.
     """
     return tool is None or tool not in _NON_TOUCH_TOOLS
+
+
+def _is_finger_size(size: Optional[float], max_size: float) -> bool:
+    """Whether a contact reporting this size may drive pinch/pan.
+
+    ``size`` is the largest contact dimension the driver reported for the
+    contact (raw device units) or ``None`` when the driver reports no size
+    axes at all, which counts as a finger.  ``max_size <= 0`` disables the
+    gate entirely.
+    """
+    if max_size <= 0.0 or size is None:
+        return True
+    return size <= max_size
 
 Box = Tuple[int, int, int, int]
 
@@ -314,6 +339,9 @@ class PinchTracker:
     re-announces the same tracking id every frame does not break the gesture.
     Contacts tagged with a non-touch tool type (pen/palm) are ignored, which
     keeps a stylus reported through the MT slots from hijacking the pinch.
+    Contacts whose reported size exceeds ``max_finger_size`` (a resting hand
+    on a driver that reports contact sizes but not tool types) are ignored in
+    the same way.
 
     Parameters
     ----------
@@ -342,6 +370,17 @@ class PinchTracker:
         60.0 raw units: above the jitter of two fingers resting close
         together, well below a deliberate pinch (typically 200-600 units
         on a 1860-wide panel).
+    max_finger_size:
+        Largest contact size (raw device units, taken as the biggest of the
+        ``ABS_MT_TOUCH_MAJOR``/``MINOR`` and ``ABS_MT_WIDTH_MAJOR``/``MINOR``
+        values the driver reports for a contact) that may still drive
+        pinch/pan.  Contacts bigger than it are dropped from the usable set
+        like a palm tag, so a resting hand cannot zoom or pan while a
+        finger-sized contact keeps working.  Contacts from drivers with no
+        size axes report ``None`` and always pass.  ``<= 0`` disables the
+        gate.  Default 100.0 raw units; the right value is device-dependent
+        (tune with ``--max-finger-size`` after checking the reported sizes
+        with ``evtest``).
     max_step:
         Clamp each per-event zoom factor into ``[1/max_step, max_step]`` so a
         noisy single event cannot teleport the scale.
@@ -352,20 +391,23 @@ class PinchTracker:
                  touch_range: Optional[Sequence[int]] = None,
                  enable_pan: bool = False,
                  min_spread: float = 60.0,
+                 max_finger_size: float = 100.0,
                  max_step: float = 1.5) -> None:
         self.canvas_w = float(canvas_w)
         self.canvas_h = float(canvas_h)
         self.rotation = int(rotation) % 360
         self.enable_pan = bool(enable_pan)
         self.min_spread = float(min_spread)
+        self.max_finger_size = float(max_finger_size)
         self.max_step = max(1.0, float(max_step))
 
         # Active contacts: slot -> {"id": float, "x": float|None, "y":
-        # float|None, "tool": int|None} in raw device units.  Protocol B:
-        # ABS_MT_SLOT selects the slot the following ABS_MT_* events belong
-        # to.  Coordinates are None until both axes have been observed for
-        # that contact; tool is None until (or unless) the driver reports
-        # ABS_MT_TOOL_TYPE for it.
+        # float|None, "tool": int|None, "size": float|None} in raw device
+        # units.  Protocol B: ABS_MT_SLOT selects the slot the following
+        # ABS_MT_* events belong to.  Coordinates are None until both axes
+        # have been observed for that contact; tool is None until (or unless)
+        # the driver reports ABS_MT_TOOL_TYPE for it; size is None until (or
+        # unless) the driver reports one of the contact-size axes for it.
         self._slots: Dict[int, Dict[str, Optional[float]]] = {}
         self._cur_slot = 0
 
@@ -406,7 +448,8 @@ class PinchTracker:
     @property
     def contacts(self) -> int:
         """Number of currently tracked slots (raw count, including contacts
-        tagged with a non-touch tool type that do not drive gestures)."""
+        excluded from gestures by a non-touch tool type or an over-large
+        contact size)."""
         return len(self._slots)
 
     def reset(self) -> None:
@@ -451,7 +494,8 @@ class PinchTracker:
                 # pinch (or a driver re-announcing the same id) no longer
                 # tears down an in-progress gesture.
                 self._slots[self._cur_slot] = {"id": float(v), "x": None,
-                                                "y": None, "tool": None}
+                                                "y": None, "tool": None,
+                                                "size": None}
             return None
 
         if c == ABS_MT_TOOL_TYPE:
@@ -461,21 +505,35 @@ class PinchTracker:
             # this code leave tool as None, which counts as a finger.
             slot = self._slots.setdefault(self._cur_slot,
                                           {"id": -2.0, "x": None, "y": None,
-                                           "tool": None})
+                                           "tool": None, "size": None})
             slot["tool"] = int(v)
+            return None
+
+        if c in _MT_SIZE_CODES:
+            # Contact size axes: keep the largest dimension the driver ever
+            # reported for this contact (drivers fill in different subsets of
+            # the four axes; the minors never exceed their own majors, so the
+            # max over everything seen is the contact's biggest dimension).
+            # A resting palm reports a much bigger value than a fingertip.
+            slot = self._slots.setdefault(self._cur_slot,
+                                          {"id": -2.0, "x": None, "y": None,
+                                           "tool": None, "size": None})
+            size = slot["size"]
+            if size is None or v > size:
+                slot["size"] = float(v)
             return None
 
         if c == ABS_MT_POSITION_X:
             slot = self._slots.setdefault(self._cur_slot,
                                           {"id": -2.0, "x": None, "y": None,
-                                           "tool": None})
+                                           "tool": None, "size": None})
             slot["x"] = float(v)
             self._observe(v, x=True)
             return None
         if c == ABS_MT_POSITION_Y:
             slot = self._slots.setdefault(self._cur_slot,
                                           {"id": -2.0, "x": None, "y": None,
-                                           "tool": None})
+                                           "tool": None, "size": None})
             slot["y"] = float(v)
             self._observe(v, x=False)
             return None
@@ -485,17 +543,21 @@ class PinchTracker:
 
     def _evaluate(self) -> Optional[GestureEvent]:
         """Compare current contact geometry against the stored baseline."""
-        # A contact is *usable* only when both axes have been observed and it
-        # carries a touch tool type.  A contact just announced by
-        # ABS_MT_TRACKING_ID has no coordinates yet, and one that has only
-        # seen POSITION_X would otherwise evaluate against a phantom y=0
-        # baseline.  Contacts tagged pen/palm/dial are excluded so a stylus
-        # reported through the MT slots cannot hijack the pinch pair; drivers
-        # that never report ABS_MT_TOOL_TYPE leave tool None, which counts as
-        # a finger.
+        # A contact is *usable* only when both axes have been observed, it
+        # carries a touch tool type and its reported size is finger-sized.  A
+        # contact just announced by ABS_MT_TRACKING_ID has no coordinates yet,
+        # and one that has only seen POSITION_X would otherwise evaluate
+        # against a phantom y=0 baseline.  Contacts tagged pen/palm/dial are
+        # excluded so a stylus reported through the MT slots cannot hijack the
+        # pinch pair; drivers that never report ABS_MT_TOOL_TYPE leave tool
+        # None, which counts as a finger.  Contacts bigger than
+        # max_finger_size are excluded the same way, which catches a resting
+        # palm on drivers that report contact sizes but no tool types;
+        # drivers without size axes leave size None, which counts as a finger.
         usable = [(slot, s) for slot, s in self._slots.items()
                   if s["x"] is not None and s["y"] is not None
-                  and _is_touch_tool(s.get("tool"))]
+                  and _is_touch_tool(s.get("tool"))
+                  and _is_finger_size(s.get("size"), self.max_finger_size)]
 
         # Reset the baselines only when the *identity* of the usable contact
         # set changes, keyed by (slot, tracking id).  Lifting, adding or

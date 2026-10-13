@@ -59,6 +59,11 @@ class TouchConfig:
     # two-finger frame counts as a gesture at all (--min-spread).  Raise it
     # if close-together fingers trigger pinch/pan by accident.
     min_spread: float = 60.0
+    # Largest contact size, in raw touch-device units, that may drive a gesture
+    # (--max-finger-size).  Bigger contacts (a resting hand/palm) are ignored,
+    # so they cannot zoom or pan.  <= 0 disables the gate; drivers without
+    # contact-size axes are unaffected.
+    max_finger_size: float = 100.0
 
 
 @dataclass

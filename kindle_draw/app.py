@@ -137,6 +137,14 @@ def parse_args(argv=None) -> argparse.Namespace:
                         "recognised at all.  Raise it if close-together "
                         "fingers trigger pinch/pan by accident; lower it for "
                         "a tighter pinch.  Default 60.")
+    g.add_argument("--max-finger-size", type=float, default=None,
+                   help="Ignore touch contacts bigger than this (raw "
+                        "touch-device units) for pinch/pan, so a hand resting "
+                        "on the screen cannot zoom.  Lower it if palm rests "
+                        "still zoom; raise it if real fingers get ignored; "
+                        "0 disables the check.  Default 100.  Only applies to "
+                        "drivers that report contact sizes (check with "
+                        "evtest).")
 
     # Pen
     g = p.add_argument_group("Pen")
@@ -770,6 +778,11 @@ def build_config(args: argparse.Namespace) -> AppConfig:
         if args.min_spread < 0:
             raise ValueError(f"--min-spread must be >= 0, got {args.min_spread}")
         touch.min_spread = float(args.min_spread)
+    if args.max_finger_size is not None:
+        if args.max_finger_size < 0:
+            raise ValueError(
+                f"--max-finger-size must be >= 0, got {args.max_finger_size}")
+        touch.max_finger_size = float(args.max_finger_size)
     # Zoom ceiling: default to the canvas resolution factor so the deepest
     # zoom shows the canvas 1:1 (every canvas pixel maps to one panel pixel)
     # and stays sharp.  Zooming past that only upscales blurry pixels.
@@ -1172,6 +1185,7 @@ def main(argv=None) -> int:
                 touch_range=cfg.touch.touch_range,
                 enable_pan=cfg.touch.pan,
                 min_spread=cfg.touch.min_spread,
+                max_finger_size=cfg.touch.max_finger_size,
             )
             touch_reader = TouchReader(
                 kindle=kindle,
@@ -1183,9 +1197,11 @@ def main(argv=None) -> int:
                 tracker=tracker,
             )
             log.info("pinch-zoom: on (max %.1fx, two-finger pan %s, "
-                     "min finger distance %.0f, range=%s)", cfg.touch.max_scale,
+                     "min finger distance %.0f, max finger size %.0f, "
+                     "range=%s)", cfg.touch.max_scale,
                      "on" if cfg.touch.pan else "off",
                      cfg.touch.min_spread,
+                     cfg.touch.max_finger_size,
                      cfg.touch.touch_range or "auto")
 
     # --- Kindle housekeeping ------------------------------------------ #

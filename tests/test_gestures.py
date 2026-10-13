@@ -9,7 +9,9 @@ from kindle_draw.gestures import (
     ABS_MT_POSITION_Y,
     ABS_MT_SLOT,
     ABS_MT_TOOL_TYPE,
+    ABS_MT_TOUCH_MAJOR,
     ABS_MT_TRACKING_ID,
+    ABS_MT_WIDTH_MAJOR,
     EV_ABS,
     EV_KEY,
     EV_SYN,
@@ -135,17 +137,20 @@ def test_reset():
 # PinchTracker: protocol-B slot bookkeeping
 # ---------------------------------------------------------------------------
 
-def _slot(tracker, slot, tid=None, x=None, y=None, tool=None):
+def _slot(tracker, slot, tid=None, x=None, y=None, tool=None, size=None):
     """Feed one slot's worth of MT-B events, closed by an EV_SYN frame.
 
     The kernel groups all slot updates for one sampling instant into a frame
     terminated by ``SYN_REPORT`` and the tracker evaluates gestures once per
     frame, so the helper mirrors that and returns the event (if any) the
-    frame produced.
+    frame produced.  ``size`` reports the contact through ABS_MT_TOUCH_MAJOR,
+    the axis most drivers fill in first.
     """
     tracker.feed(EV_ABS, ABS_MT_SLOT, slot)
     if tid is not None:
         tracker.feed(EV_ABS, ABS_MT_TRACKING_ID, tid)
+    if size is not None:
+        tracker.feed(EV_ABS, ABS_MT_TOUCH_MAJOR, size)
     if x is not None:
         tracker.feed(EV_ABS, ABS_MT_POSITION_X, x)
     if y is not None:
@@ -392,6 +397,89 @@ def test_tool_type_none_counts_as_finger():
     ev = _slot(tr, 0, x=1100, y=1700)
     assert ev is not None and ev.kind == "pinch"
     assert ev.factor == pytest.approx(1.5)
+
+
+# ---------------------------------------------------------------------------
+# PinchTracker: contact-size gating (rejection of a resting hand)
+# ---------------------------------------------------------------------------
+
+def test_oversized_contacts_do_not_pinch():
+    # A resting hand reported as two large contacts (no MT_TOOL_PALM tag,
+    # only size info) must not drive pinch even while the contacts spread.
+    tr = PinchTracker(1860, 2480, touch_range=(1860, 2480))
+    assert _slot(tr, 0, tid=10, x=500, y=500, size=140) is None
+    assert _slot(tr, 1, tid=11, x=700, y=700, size=160) is None
+    assert _slot(tr, 0, x=400, y=400) is None  # spread grows: still no pinch
+
+
+def test_finger_plus_palm_size_is_not_a_pinch():
+    # One fingertip (size 30) plus one palm-sized contact (size 150): the
+    # palm is excluded from the usable set, and the lone remaining finger
+    # must not produce a pinch.
+    tr = PinchTracker(1860, 2480, touch_range=(1860, 2480))
+    assert _slot(tr, 0, tid=10, x=500, y=500, size=30) is None
+    assert _slot(tr, 1, tid=11, x=700, y=700, size=150) is None
+    assert _slot(tr, 1, x=900, y=900) is None  # palm drags: ignored
+
+
+def test_palm_size_joining_mid_pinch_keeps_baseline():
+    # A palm-sized contact joining an in-progress two-finger pinch must not
+    # change the identity of the usable set, so the pair baseline survives
+    # and the gesture continues from the pre-join spread.
+    tr = PinchTracker(1860, 2480, touch_range=(1860, 2480))
+    assert _slot(tr, 0, tid=10, x=1200, y=1800, size=30) is None
+    assert _slot(tr, 1, tid=11, x=1400, y=2000, size=30) is None
+    assert _slot(tr, 2, tid=12, x=300, y=300, size=150) is None  # palm joins
+    ev = _slot(tr, 0, x=1100, y=1700)  # 200*sqrt2 -> 300*sqrt2
+    assert ev is not None and ev.kind == "pinch"
+    assert ev.factor == pytest.approx(1.5)
+
+
+def test_contact_size_at_threshold_is_accepted():
+    # size == max_finger_size is still finger-sized: the gate excludes only
+    # strictly larger contacts.
+    tr = PinchTracker(1860, 2480, touch_range=(1860, 2480),
+                      max_finger_size=100.0)
+    assert _slot(tr, 0, tid=10, x=1200, y=1800, size=100) is None
+    assert _slot(tr, 1, tid=11, x=1400, y=2000, size=100) is None
+    ev = _slot(tr, 0, x=1100, y=1700)
+    assert ev is not None and ev.kind == "pinch"
+    assert ev.factor == pytest.approx(1.5)
+
+
+def test_size_running_max_across_axes():
+    # Drivers fill in different subsets of the four MT size axes, so the
+    # tracker keeps the running max of everything reported for a slot.  A
+    # contact announced with a small TOUCH_MAJOR that later swells via
+    # WIDTH_MAJOR is excluded from that frame onward, which resets the pair
+    # baseline (usable-set identity changed) instead of emitting a jump.
+    tr = PinchTracker(1860, 2480, touch_range=(1860, 2480))
+    assert _slot(tr, 0, tid=10, x=1200, y=1800, size=20) is None
+    assert _slot(tr, 1, tid=11, x=1400, y=2000) is None  # no size: finger
+    tr.feed(EV_ABS, ABS_MT_SLOT, 0)
+    tr.feed(EV_ABS, ABS_MT_WIDTH_MAJOR, 150)  # slot 0 swells on another axis
+    assert tr.feed(EV_SYN, 0, 0) is None      # pair reset, single: no pinch
+    assert _slot(tr, 1, x=1500, y=2100) is None  # fresh single baseline: none
+
+
+def test_max_finger_size_zero_disables_gate():
+    # max_finger_size <= 0 turns the size gate off entirely: contacts of any
+    # reported size stay usable.
+    tr = PinchTracker(1860, 2480, touch_range=(1860, 2480),
+                      max_finger_size=0.0)
+    assert _slot(tr, 0, tid=10, x=1200, y=1800, size=1000) is None
+    assert _slot(tr, 1, tid=11, x=1400, y=2000, size=1000) is None
+    ev = _slot(tr, 0, x=1100, y=1700)
+    assert ev is not None and ev.kind == "pinch"
+    assert ev.factor == pytest.approx(1.5)
+
+
+def test_oversized_contact_does_not_pan():
+    # Single-finger pan honours the size gate too: a resting palm dragging
+    # across the panel must not pan the canvas.
+    tr = PinchTracker(1860, 2480, touch_range=(1860, 2480), enable_pan=True)
+    assert _slot(tr, 0, tid=10, x=500, y=500, size=150) is None
+    assert _slot(tr, 0, x=700, y=700) is None
 
 
 # ---------------------------------------------------------------------------

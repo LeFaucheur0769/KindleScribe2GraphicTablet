@@ -606,7 +606,8 @@ class Launcher(QMainWindow):
         """Pinch-zoom / pan controls, mirroring the CLI's Touch group.
 
         Maps to ``--pinch``, ``--touch-pan``, ``--max-zoom``,
-        ``--touch-dev`` and ``--touch-range``.  The box is only enabled in
+        ``--min-spread``, ``--max-finger-size``, ``--touch-dev`` and
+        ``--touch-range``.  The box is only enabled in
         canvas mode because the gesture manipulates the host-side canvas
         viewport (the CLI warns and ignores ``--pinch`` in other modes).
         """
@@ -666,6 +667,18 @@ class Launcher(QMainWindow):
             "recognised at all.  Raise it if close-together fingers\n"
             "trigger pinch/pan by accident; lower it for a tighter pinch.")
         form.addRow("Min finger distance", self._min_spread)
+
+        self._max_finger_size = QDoubleSpinBox()
+        self._max_finger_size.setRange(0.0, 1000.0)
+        self._max_finger_size.setSingleStep(10.0)
+        self._max_finger_size.setValue(100.0)
+        self._max_finger_size.setToolTip(
+            "Ignore touch contacts bigger than this (--max-finger-size),\n"
+            "in raw touch-device units, so a hand resting on the screen\n"
+            "cannot zoom or pan.  Lower it if palm rests still zoom; raise\n"
+            "it if real fingers get ignored; 0 disables the check.  Only\n"
+            "applies to drivers that report contact sizes (check evtest).")
+        form.addRow("Max finger size", self._max_finger_size)
 
         self._touch_dev = QLineEdit()
         self._touch_dev.setPlaceholderText("auto — e.g. /dev/input/event2")
@@ -751,7 +764,8 @@ class Launcher(QMainWindow):
     def _on_pinch_toggled(self, on: bool) -> None:
         """Gate the pinch sub-options behind the main --pinch checkbox."""
         for widget in (self._touch_pan, self._max_zoom, self._min_spread,
-                       self._touch_dev, self._touch_range):
+                       self._max_finger_size, self._touch_dev,
+                       self._touch_range):
             widget.setEnabled(on)
 
     def _on_resolution_changed(self, index: int) -> None:
@@ -806,6 +820,7 @@ class Launcher(QMainWindow):
             "canvas_resolution": self._canvas_res.currentIndex() + 1,
             "max_zoom": self._max_zoom.value(),
             "min_spread": self._min_spread.value(),
+            "max_finger_size": self._max_finger_size.value(),
             "touch_dev": self._touch_dev.text().strip(),
             "touch_range": self._touch_range.text().strip(),
         }
@@ -895,6 +910,7 @@ class Launcher(QMainWindow):
         b("touch_pan", self._touch_pan)
         self._max_zoom.setValue(float(cfg.get("max_zoom", 4.0)))
         self._min_spread.setValue(float(cfg.get("min_spread", 60.0)))
+        self._max_finger_size.setValue(float(cfg.get("max_finger_size", 100.0)))
         self._touch_dev.setText(str(cfg.get("touch_dev", "") or ""))
         self._touch_range.setText(str(cfg.get("touch_range", "") or ""))
 
@@ -1006,6 +1022,7 @@ class Launcher(QMainWindow):
                 args += ["--touch-pan"]
             args += ["--max-zoom", str(cfg["max_zoom"])]
             args += ["--min-spread", str(cfg["min_spread"])]
+            args += ["--max-finger-size", str(cfg["max_finger_size"])]
             if cfg["touch_dev"]:
                 args += ["--touch-dev", cfg["touch_dev"]]
             # The range field is free text: empty or "auto" means let the
